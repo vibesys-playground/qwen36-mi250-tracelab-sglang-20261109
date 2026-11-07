@@ -1,0 +1,7 @@
+# The candidate image's build context is the repository root; serving/Dockerfile copies sglang/.
+# Leave out what no build step reads, so that the image's digest does not change with it.
+.vibesys
+.vibesys-state
+engine
+**/__pycache__
+**/*.pyc

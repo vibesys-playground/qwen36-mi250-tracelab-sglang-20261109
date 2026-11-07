@@ -1,25 +1,52 @@
-version = "0.1"
+# Qwen3.6-35B-A3B on one MI250 node (8 GCDs), TraceLab recorded-session replay, starting from
+# upstream SGLang: the two-image task for vibesys-cli (schema 0.2). The candidate's server runs in
+# the image its commit's serving/Dockerfile builds; this directory is the task image (Dockerfile
+# here), whose commands reach the server at VIBESYS_SERVICE_URL.
+version = "0.2"
 backends = ["rocm"]
 
 [agent]
 domain = "llm-serving"
 interface = "service"
 
+# The operator provides the Hugging Face cache (Qwen/Qwen3.6-35B-A3B at the revision in
+# reference/meta.json, with its tokenizer) as the read-only mount named "hf"; both images read
+# it offline.
+[environment]
+needs = ["mounts"]
+
+# The candidate owns serving/Dockerfile, serving/serve.sh and everything the build context holds.
+# The contract is the argv below: the pinned checkpoint from the mount, 127.0.0.1:${PORT}, the
+# full 262,144-token context, and /health answering 2xx once the server can serve.
+[candidate]
+dockerfile = "serving/Dockerfile"
+context = "."
+serve = [
+  "bash", "serving/serve.sh",
+  "--model-path", "Qwen/Qwen3.6-35B-A3B",
+  "--revision", "995ad96eacd98c81ed38be0c5b274b04031597b0",
+  "--host", "127.0.0.1",
+  "--port", "${PORT}",
+  "--context-length", "262144",
+]
+ready = "/health"
+startup_timeout_seconds = 3600
+
 [accuracy]
-command = ["uv", "run", "python", "-I", "${PROJECT_ROOT}/.vibesys/tasks/default/accuracy_checker/checker.py"]
+command = ["python", "-I", "/task/accuracy_checker/checker.py"]
 timeout_seconds = 300
 
-[evaluator]
-name = "vibesys-evaluator-request-factory"
-version = "0.1.0"
-
 [benchmark]
-entrypoint = "request-factory-adapter"
-args = ["${PROJECT_ROOT}/.vibesys/shared/tracelab/replay.py"]
+# vibesys-cli appends --vs-output FILE. The adapter's own runner deadline is 3000 s.
+command = [
+  "python", "-I", "/task/tracelab/replay.py",
+  "--request-factory-engine", "/usr/local/bin/session_runner",
+]
 timeout_seconds = 3600
 result_protocol = 2
 
-# Upstream SGLang main, the candidate's starting point. The commit appears only here.
+# Upstream SGLang main, the candidate's starting point, vendored at sglang/ (provenance in
+# _vibesys_sources.json). vibesys-cli does not read this table.
 [[workspace.sources]]
 name = "sglang"
 repo = "https://github.com/sgl-project/sglang"

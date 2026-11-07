@@ -51,12 +51,35 @@ checker's short chat probes, using a non-thinking default so answers fit their
 small output budgets. Honor explicit template options, preserve supplied
 reasoning/tool history, and make temperature-zero completions repeatable.
 
-Run the configured service checker before benchmarking. It is shared with the
-existing H100 task and checks sentinel echo, known answers, and greedy
-repeatability. These are behavioral probes, **not numerical parity or proof of
-checkpoint identity**. Correct hybrid state and routing remain requirements;
+Run the configured service checker before benchmarking. It is the existing
+H100 task's checker (a copy in this task's `accuracy_checker/`) and checks
+sentinel echo, known answers, and greedy repeatability. These are behavioral
+probes, **not numerical parity or proof of checkpoint identity**. Correct hybrid state and routing remain requirements;
 a passing behavioral probe does not authorize altered model execution.
 No full-size run has validated the SGLang checkout on MI250 yet.
+
+## Service contract
+
+The task builds the candidate's server image from the candidate commit's
+`serving/Dockerfile`, with the repository root as the build context (the root
+`.dockerignore` narrows it), and starts the server in that image from the
+checkout's root on the node's eight GCDs as:
+
+```
+bash serving/serve.sh --model-path Qwen/Qwen3.6-35B-A3B \
+  --revision 995ad96eacd98c81ed38be0c5b274b04031597b0 \
+  --host 127.0.0.1 --port <port> --context-length 262144
+```
+
+The server must serve the pinned checkpoint from the operator's read-only
+Hugging Face cache, mounted at `/vibesys/mounts/hf`, offline; listen on
+`127.0.0.1` at the given port; keep the full 262,144-token context; and answer
+`GET /health` with a 2xx status once it can serve requests, within 3,600
+seconds of starting. The checker and the replay then run in the task's own
+image and reach the server only over HTTP. `serving/Dockerfile`,
+`serving/serve.sh`, the root `.dockerignore` and everything they build from
+are candidate code: change the image, the server's flags and its parallel
+layout there, never in `.vibesys/`.
 
 ## TraceLab recorded workload and objectives
 
@@ -80,16 +103,19 @@ kernels; it is a separate frontier from the 15-minute AgentX task.
 Optimize output tokens/s (maximize), TTFT p50/p90 and TPOT p50/p90 in milliseconds
 (minimize), with 3% relative noise tolerance. A failed round, missing metric,
 wrong token count or incomplete replay fails measurement. No dry-run result is
-accepted. See [the TraceLab adapter](../../shared/tracelab/README.md).
+accepted. See [the TraceLab adapter](tracelab/README.md).
 
 ## Starting point
 
 The workspace contains a checkout of upstream **SGLang** (`sgl-project/sglang`
-main) at `sglang/`, pinned via `[[workspace.sources]]`; provenance is in
-`_vibesys_sources.json`. Do not write the serving system from scratch: start
-from SGLang's OpenAI-compatible server, scheduler, radix prefix cache, and its
-support for hybrid linear-attention MoE models, adapting them to gfx90a and
-this workload. Its kernels, build steps and dependencies may assume another GPU
+main) at `sglang/`, vendored unmodified at the commit recorded in
+`[[workspace.sources]]`; provenance is in `_vibesys_sources.json`. The
+starting `serving/Dockerfile` installs it by upstream's own ROCm
+install-from-source steps and `serving/serve.sh` starts upstream's standard
+`python -m sglang.launch_server`; neither has been run on MI250. Do not write
+the serving system from scratch: start from SGLang's OpenAI-compatible
+server, scheduler, radix prefix cache, and its support for hybrid
+linear-attention MoE models, adapting them to gfx90a and this workload. Its kernels, build steps and dependencies may assume another GPU
 architecture; port, replace or disable them as needed without changing model
 semantics. Vendored SGLang code counts as the candidate's own code, and you
 may edit, prune, or rebuild any part of the checkout freely. It is ordinary

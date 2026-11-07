@@ -144,8 +144,11 @@ layout depends on the platform. The tasks' hardware count is 8, the GCDs.
 - [`mi2508x-tracelab`](.vibesys/tasks/mi2508x-tracelab/OBJECTIVE.md) starts
   from the baseline engine, like the other tasks.
 - [`mi2508x-tracelab-sglang`](.vibesys/tasks/mi2508x-tracelab-sglang/OBJECTIVE.md)
-  places a pinned upstream SGLang checkout at `sglang/` in the candidate
-  workspace through `[[workspace.sources]]`; its manifest holds the commit.
+  vendors a pinned upstream SGLang checkout at `sglang/` (provenance in
+  `_vibesys_sources.json`; its manifest's `[[workspace.sources]]` holds the
+  commit). It is a vibesys-cli task of two images: the candidate's server image
+  is built from `serving/Dockerfile` and started with `serving/serve.sh` on
+  `127.0.0.1:<port>`, ready at `/health`; its OBJECTIVE.md states the contract.
   The baseline engine is not its starting point.
   The candidate adapts and optimizes that checkout for gfx90a, under the same
   model, correctness and no-quantization rules. SGLang's ROCm support centers
