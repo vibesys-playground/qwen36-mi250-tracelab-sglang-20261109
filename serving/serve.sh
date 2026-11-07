@@ -7,4 +7,7 @@
 # The starting point is upstream SGLang's standard server with only what loading the
 # checkpoint across the node's eight GPUs needs.
 set -euo pipefail
+# The checkout's root holds the vendored sglang/ tree, which Python would import from the
+# working directory as a namespace package in place of the package the image installed.
+cd /
 exec python3 -m sglang.launch_server "$@" --tp-size 8
