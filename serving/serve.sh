@@ -23,9 +23,17 @@ fi
 #   apart, so every collective goes through RCCL.
 # - The chat default is non-thinking (per-request chat_template_kwargs still override it).
 # - Usage reports cached prompt tokens, which the replay's prefix-cache accounting reads.
+# - Speculative decoding with the checkpoint's own MTP head (mtp.* tensors, one layer): it
+#   drafts 2 tokens per step as a topk=1 chain and the target verifies all 3 positions in one
+#   forward. Temperature-0 requests verify greedily (accept only the target's argmax), so the
+#   emitted tokens are the target's greedy tokens.
 exec python3 -m sglang.launch_server "$@" \
   --tp-size 8 \
   --attention-backend triton \
   --disable-custom-all-reduce \
   --enable-cache-report \
-  --default-chat-template-kwargs '{"enable_thinking": false}'
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 2 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 3

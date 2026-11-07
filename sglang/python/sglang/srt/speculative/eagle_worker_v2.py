@@ -556,22 +556,45 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Keep imports local so non-HIP environments do not require these.
             # aiter packs draft-extend support into the decode (multi-step)
             # backend; DSV4 exposes it on the draft-extend backend itself.
-            from sglang.srt.layers.attention.aiter_backend import (
-                AiterMultiStepDraftBackend,
-            )
-            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-                DeepseekV4HipRadixBackend,
-            )
-            from sglang.srt.layers.attention.dsa_backend import (
-                DeepseekSparseAttnBackend,
-            )
+            # Each backend module pulls in aiter or gfx942+ kernels at import
+            # time; on a build without them (e.g. gfx90a with Triton attention)
+            # those backends cannot be in use, so a failed import just means
+            # "not this backend".
+            hip_graph_backends = []
+            try:
+                from sglang.srt.layers.attention.aiter_backend import (
+                    AiterMultiStepDraftBackend,
+                )
 
-            supports_hip_draft_extend_graph = (
-                isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
-                or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
-                or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
-                or isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
+                hip_graph_backends.append(
+                    isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
+                )
+            except (ImportError, OSError, RuntimeError):
+                pass
+            try:
+                from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+                    DeepseekV4HipRadixBackend,
+                )
+
+                hip_graph_backends.append(
+                    isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
+                )
+            except (ImportError, OSError, RuntimeError):
+                pass
+            try:
+                from sglang.srt.layers.attention.dsa_backend import (
+                    DeepseekSparseAttnBackend,
+                )
+
+                hip_graph_backends.append(
+                    isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
+                )
+            except (ImportError, OSError, RuntimeError):
+                pass
+            hip_graph_backends.append(
+                isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
             )
+            supports_hip_draft_extend_graph = any(hip_graph_backends)
 
         graph_supported_backend_types = [
             TritonAttnBackend,
