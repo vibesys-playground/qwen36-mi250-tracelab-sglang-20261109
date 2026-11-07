@@ -10,6 +10,12 @@ set -euo pipefail
 # The checkout's root holds the vendored sglang/ tree, which Python would import from the
 # working directory as a namespace package in place of the package the image installed.
 cd /
+# Triton, the JIT kernels and torch write caches under $HOME; a job may run as a user whose HOME
+# is missing or read-only inside the image.
+if ! { mkdir -p "${HOME:-/nonexistent}" && [ -w "$HOME" ]; } 2>/dev/null; then
+  export HOME
+  HOME="$(mktemp -d)"
+fi
 # MI250 (gfx90a) adaptations, none of which changes the model's math:
 # - The HIP default attention backend is aiter, which the image does not install and which
 #   targets gfx942/gfx950; Triton attention runs on gfx90a. GDN layers already use Triton.
