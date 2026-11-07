@@ -1,0 +1,10 @@
+[
+  {
+    "name": "sglang",
+    "repo": "https://github.com/sgl-project/sglang",
+    "commit": "286cb448b1c03fc15f4ab10b39c449dfdb47794a",
+    "requested_commit": "286cb448b1c03fc15f4ab10b39c449dfdb47794a",
+    "dest": "sglang",
+    "strip_git": true
+  }
+]
