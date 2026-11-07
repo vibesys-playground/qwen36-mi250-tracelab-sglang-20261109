@@ -25,7 +25,9 @@ RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 3 --retry-all-errors
 COPY sglang /sgl-workspace/sglang
 WORKDIR /sgl-workspace/sglang
 
-# Compile sgl-kernel.
+# Compile sgl-kernel for MI250 (gfx90a). The build has no GPU, so setup_rocm.py cannot probe the
+# architecture and would otherwise default to gfx942, whose code objects do not load on gfx90a.
+ENV AMDGPU_TARGET=gfx90a
 RUN cd python/sglang/kernels/aot \
  && rm -f pyproject.toml \
  && mv pyproject_rocm.toml pyproject.toml \
