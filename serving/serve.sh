@@ -34,6 +34,10 @@ fi
 # replica whose radix and recurrent-state cache holds its prefix; new sessions go to the
 # least-loaded replica.
 # Save recurrent state every 64 decode tokens (default 256) so later rounds' prefix hits cover more of the previous output.
+# Speculative decoding with the checkpoint's own MTP head (mtp.* tensors, one layer): it
+#   drafts 2 tokens per step as a topk=1 chain and the target verifies all 3 positions in one
+#   forward. Temperature-0 requests verify greedily (accept only the target's argmax), so the
+#   emitted tokens are the target's greedy tokens.
 exec python3 -m sglang.launch_server "$@" \
   --tp-size 2 \
   --dp-size 4 \
@@ -43,4 +47,8 @@ exec python3 -m sglang.launch_server "$@" \
   --cuda-graph-max-bs-prefill 2816 \
   --enable-cache-report \
   --mamba-track-interval 64 \
-  --default-chat-template-kwargs '{"enable_thinking": false}'
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 2 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 3
