@@ -33,6 +33,28 @@ def _use_low_smem_fp8_default() -> bool:
     return smem_limit is not None and smem_limit < _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES
 
 
+@functools.lru_cache(maxsize=None)
+def _config_device_name() -> str:
+    """Device name used in config file names.
+
+    gfx90a parts report different marketing names (MI210, MI250, MI250X/MI250, with a
+    '/' in some ROCm builds, which would split the file name into a directory). Tuned
+    configs for the whole gfx90a family share one name so the lookup does not depend on it.
+    """
+    if _is_hip and torch.cuda.is_available():
+        try:
+            arch = getattr(
+                torch.cuda.get_device_properties(torch.cuda.current_device()),
+                "gcnArchName",
+                "",
+            )
+            if arch.startswith("gfx90a"):
+                return "AMD_Instinct_gfx90a"
+        except Exception:
+            pass
+    return get_device_name().replace(" ", "_")
+
+
 def get_config_file_name(
     E: int,
     N: int,
@@ -41,7 +63,7 @@ def get_config_file_name(
     per_channel_quant: bool = False,
     down_moe: bool = False,
 ) -> str:
-    device_name = get_device_name().replace(" ", "_")
+    device_name = _config_device_name()
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
