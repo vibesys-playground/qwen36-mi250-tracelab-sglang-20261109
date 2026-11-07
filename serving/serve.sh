@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# The candidate's server, started by the task from the checkout's root in the image
-# serving/Dockerfile builds. The task passes the contract's arguments: the checkpoint and its
-# revision (read offline from the mounted Hugging Face cache), --host 127.0.0.1, --port, and
-# --context-length 262144. This script is the candidate's to change.
-#
-# The starting point is upstream SGLang's standard server with only what loading the
-# checkpoint across the node's eight GPUs needs.
+# Throwaway harness probe: map the task's serve arguments onto the baseline engine's.
 set -euo pipefail
-exec python3 -m sglang.launch_server "$@" --tp-size 8
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model-path) args+=(--model "$2"); shift 2 ;;
+    --context-length) args+=(--max-model-len "$2"); shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+exec python3 -m engine.server "${args[@]}"
