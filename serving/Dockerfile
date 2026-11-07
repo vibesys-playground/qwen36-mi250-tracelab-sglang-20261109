@@ -1,8 +1,10 @@
 # Throwaway harness probe: the project's baseline Transformers engine (engine/) behind the task's
-# service contract. Same base as the SGLang starting point; adds the engine's pins.
-FROM rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1@sha256:376bfab5f4f680c8b4b843c6d0c5d1f0a04e5a84ec3e86728db8d11d79a9d1e3
-RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt \
- && pip install --no-cache-dir -c /tmp/constraints.txt transformers==5.22.1 accelerate==1.12.0 \
+# service contract, on the stack the project README gives for the AMD tasks (Python 3.12,
+# torch 2.9.1+rocm6.4, requirements-agentx.txt), over the ROCm 6.4 base the vibesys example uses.
+FROM rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1@sha256:f444357218627704168ef31d991cb6827999208d38906b9c22383c6a829f54e9
+COPY requirements-agentx.txt /tmp/requirements-agentx.txt
+RUN python3 -m pip install --no-cache-dir 'torch==2.9.1+rocm6.4' --index-url https://download.pytorch.org/whl/rocm6.4 \
+ && python3 -m pip install --no-cache-dir -r /tmp/requirements-agentx.txt \
  && python3 -c "import torch, transformers; assert torch.version.hip; print(torch.__version__, transformers.__version__)"
 ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/vibesys/mounts/hf HF_HUB_OFFLINE=1
