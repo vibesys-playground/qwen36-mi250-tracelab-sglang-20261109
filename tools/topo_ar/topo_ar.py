@@ -541,10 +541,232 @@ def ca_bench_one(rank, g_ranks, pg, ca, nccl, kb):
     return res
 
 
+# ---- calarge mode: correctness of the head's custom AR on 4-16 MB messages (plan 6) ----
+LARGE_ITERS = 200
+MIB = 1 << 20
+# (label, bytes, expected route). 16 MiB is CustomAllreduce.max_size on ROCm (inclusive).
+LARGE_SIZES = [
+    ("4MB", 4 * MIB, "CA"),
+    ("8MB", 8 * MIB, "CA"),
+    ("12MB", 12 * MIB, "CA"),
+    ("16MB", 16 * MIB, "CA"),
+    ("16MB+16B", 16 * MIB + 16, "RCCL"),
+]
+
+
+def _large_A(rank, it, rows, mode):
+    g = torch.Generator(device="cuda")
+    g.manual_seed(1_000_003 * rank + 7919 * it + (0 if mode == "eager" else 500_009) + 17)
+    return torch.randn(rows, HIDDEN, generator=g, device="cuda", dtype=torch.float32).to(torch.bfloat16)
+
+
+def _large_W(rank):
+    g = torch.Generator(device="cuda")
+    g.manual_seed(4242 + rank)
+    return (torch.randn(HIDDEN, HIDDEN, generator=g, device="cuda", dtype=torch.float32) * 0.02
+            ).to(torch.bfloat16)
+
+
+def calarge_one(rank, g_ranks, pg, ca, nccl, car, label, nbytes, expect, mode, counters):
+    import statistics
+
+    n = nbytes // 2
+    rows = (n + HIDDEN - 1) // HIDDEN
+    W = {r: _large_W(r) for r in g_ranks}
+    Wm = W[rank]
+    probe = torch.empty(n, dtype=torch.bfloat16, device="cuda")
+    routed = "CA" if ca.should_custom_ar(probe) else "RCCL"
+    del probe
+    assert routed == expect, f"{label}: routed {routed}, expected {expect}"
+    use_ca = routed == "CA"
+    wpos = (torch.arange(n, device="cuda", dtype=torch.int64) % 65521) + 1
+    wpos2 = (torch.arange(n, device="cuda", dtype=torch.int64) * 2654435761 % 1000003) + 1
+
+    def reduce(hv):
+        if use_ca:
+            out = ca.custom_all_reduce(hv)
+            assert out is not None
+            return out
+        assert ca.custom_all_reduce(hv) is None  # CA declines; the caller falls back to RCCL
+        return nccl.outplace_all_reduce(hv)
+
+    A = _large_A(rank, 0, rows, mode)
+    # warm hipBLASLt workspace (eager and on the capture stream) before any capture
+    for _ in range(3):
+        torch.mm(A, Wm)
+    torch.cuda.synchronize()
+    cnt0 = dict(counters)
+    graphs = {}
+    if mode == "graph":
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                torch.mm(A, Wm)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with ca.capture(), nccl.change_state(enable=True):
+            with torch.cuda.graph(g, stream=s):
+                h = torch.mm(A, Wm)
+                hv = h.view(-1)[:n]
+                out_g = reduce(hv)
+        g2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2, stream=s):
+            h2 = torch.mm(A, Wm)
+        torch.cuda.synchronize()
+        graphs = dict(g=g, gemm=g2, h=hv, out=out_g)
+        captured_calls = {k: counters[k] - cnt0[k] for k in counters}
+    bad = 0
+    maxulp = 0.0
+    exact_min = 1.0
+    gemm_mismatch = 0
+    hashes = []
+    ev_us = []
+    for it in range(LARGE_ITERS):
+        # fresh reference: fp32 sum of every rank's GEMM output, regenerated locally
+        ref = torch.zeros(n, dtype=torch.float32, device="cuda")
+        own_ref = None
+        for r in g_ranks:
+            hr = torch.mm(_large_A(r, it, rows, mode), W[r]).view(-1)[:n]
+            ref += hr.float()
+            if r == rank:
+                own_ref = hr
+        a_new = _large_A(rank, it, rows, mode)
+        dist.barrier(group=pg)  # nobody overwrites its input while a peer still reads it
+        if mode == "graph":
+            A.copy_(a_new)
+            graphs["g"].replay()
+            torch.cuda.synchronize()
+            out = graphs["out"]
+            if use_ca:  # input snapshot is intact (out of place): own GEMM must match eager
+                gemm_mismatch += int((graphs["h"] != own_ref).sum().item())
+        else:
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            h = torch.mm(a_new, Wm)  # GEMM writes the input just before the call
+            hv = h.view(-1)[:n]
+            e0.record()
+            out = reduce(hv)
+            e1.record()
+            torch.cuda.synchronize()
+            ev_us.append(e0.elapsed_time(e1) * 1e3)
+            if use_ca:
+                gemm_mismatch += int((hv != own_ref).sum().item())
+        m, b, ex = _ulp_err(out, ref)
+        maxulp, bad, exact_min = max(maxulp, m), bad + b, min(exact_min, ex)
+        iv = out.view(torch.int16).to(torch.int64)
+        hashes.append((int((iv * wpos).sum().item()), int((iv * wpos2).sum().item())))
+    # latency: chained GEMM+AR minus chained GEMM-only
+    reps = 30
+    lat = {}
+    if mode == "graph":
+        for name, gg in (("ar+gemm", graphs["g"]), ("gemm", graphs["gemm"])):
+            gg.replay()
+            torch.cuda.synchronize()
+            dist.barrier(group=pg)
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                gg.replay()
+            torch.cuda.synchronize()
+            lat[name] = (time.perf_counter() - t0) / reps * 1e6
+    else:
+        def chain(with_ar):
+            for _ in range(reps):
+                h = torch.mm(A, Wm)
+                if with_ar:
+                    reduce(h.view(-1)[:n])
+        for name, w in (("ar+gemm", True), ("gemm", False)):
+            chain(w)
+            torch.cuda.synchronize()
+            dist.barrier(group=pg)
+            t0 = time.perf_counter()
+            chain(w)
+            torch.cuda.synchronize()
+            lat[name] = (time.perf_counter() - t0) / reps * 1e6
+    res = dict(label=label, mode=mode, routed=routed, bad=bad, maxulp=maxulp, exact=exact_min,
+               gemm_mismatch=gemm_mismatch, hashes=hashes,
+               ar_us=lat["ar+gemm"] - lat["gemm"], gemm_us=lat["gemm"],
+               ev_med_us=(statistics.median(ev_us) if ev_us else None),
+               kernel_calls={k: counters[k] - cnt0[k] for k in counters})
+    if mode == "graph":
+        res["capture_calls"] = captured_calls
+    del graphs
+    return res
+
+
+def calarge_worker(rank, world):
+    import faulthandler
+
+    faulthandler.dump_traceback_later(1650, exit=True)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world,
+                            init_method="tcp://127.0.0.1:29594")
+    from sglang.srt.distributed.device_communicators import custom_all_reduce as car
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ca_variant
+    mod = ca_variant.build(os.environ["CA_REPO_ROOT"], os.environ["CA_VARIANT_DIR"])
+    ca_variant.install(car.ops, mod)
+    counters = {"all_reduce_unreg": 0, "all_reduce_reg": 0}
+    for k in counters:
+        def mk(name, orig):
+            def f(*a, **kw):
+                counters[name] += 1
+                return orig(*a, **kw)
+            return f
+        setattr(car.ops, k, mk(k, getattr(car.ops, k)))
+    groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    pgs = [dist.new_group(g, backend="gloo") for g in groups]
+    gi = rank // 2
+    g_ranks, pg = groups[gi], pgs[gi]
+    ca = car.CustomAllreduce(group=pg, device=rank)
+    nccl = PyNcclCommunicator(pg, device=rank)
+    print(f"CAINIT rank{rank} group={g_ranks} disabled={ca.disabled} max_size={ca.max_size} "
+          f"full_nvlink={ca.full_nvlink} deterministic={ca.use_amd_deterministic_impl}",
+          flush=True)
+    for label, nbytes, expect in LARGE_SIZES:
+        for mode in ("eager", "graph"):
+            dist.barrier()
+            try:
+                val = calarge_one(rank, g_ranks, pg, ca, nccl, car, label, nbytes, expect, mode,
+                                  counters)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                val = f"ERR {type(e).__name__}: {e}"
+            gathered = [None] * world
+            dist.all_gather_object(gathered, val)
+            if rank == 0:
+                for gj, g in enumerate(groups):
+                    vals = [gathered[r] for r in g]
+                    errs = [v for v in vals if isinstance(v, str)]
+                    if errs:
+                        print(f"LARGE {label:9s} {mode:5s} pair{gj} {errs[0]}", flush=True)
+                        continue
+                    same = vals[0]["hashes"] == vals[1]["hashes"]
+                    v0 = vals[0]
+                    print(f"LARGE {label:9s} {mode:5s} pair{gj} routed={v0['routed']} "
+                          f"bad={sum(v['bad'] for v in vals)} "
+                          f"maxerr_ulp={max(v['maxulp'] for v in vals):.2f} "
+                          f"exact_frac={min(v['exact'] for v in vals):.6f} "
+                          f"ranks_bitwise_identical={same} iters={LARGE_ITERS} "
+                          f"gemm_self_mismatch={sum(v['gemm_mismatch'] for v in vals)} "
+                          f"ar_us={max(v['ar_us'] for v in vals):.1f} "
+                          f"gemm_us={max(v['gemm_us'] for v in vals):.1f} "
+                          f"eager_ar_event_median_us="
+                          f"{max((v['ev_med_us'] or 0) for v in vals):.1f} "
+                          f"kernel_calls={v0['kernel_calls']} "
+                          f"capture_calls={v0.get('capture_calls')}", flush=True)
+    dist.barrier()
+    faulthandler.cancel_dump_traceback_later()
+    dist.destroy_process_group()
+
+
 def main():
     world = torch.cuda.device_count()
-    if os.environ.get("TOPO_AR_MODE") == "ca":
-        print("devices:", world, "mode: ca", flush=True)
+    if os.environ.get("TOPO_AR_MODE") in ("ca", "calarge"):
+        print("devices:", world, "mode:", os.environ["TOPO_AR_MODE"], flush=True)
         # Build the fenced gfx90a variant once here; the workers then load the built module.
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         try:
@@ -558,7 +780,10 @@ def main():
             print(f"fenced variant built in {time.time() - t0:.0f}s", flush=True)
         except Exception as e:  # noqa: BLE001
             print("fenced variant build failed:", e, flush=True)
-        mp.spawn(ca_worker, args=(world,), nprocs=world, join=True)
+        if os.environ["TOPO_AR_MODE"] == "calarge":
+            mp.spawn(calarge_worker, args=(world,), nprocs=world, join=True)
+        else:
+            mp.spawn(ca_worker, args=(world,), nprocs=world, join=True)
         return
     if os.environ.get("TOPO_AR_MODE") == "pynccl":
         print("devices:", world, "mode: pynccl", flush=True)
