@@ -66,7 +66,8 @@ def build(repo_root, build_dir=None, verbose=False):
     os.makedirs(d, exist_ok=True)
     src = os.path.join(repo_root, SRC)
     cuh = open(os.path.join(src, "custom_all_reduce_hip.cuh")).read()
-    assert cuh.count(START_SYNC_OLD) == 1, "start_sync text changed; update ca_variant.py"
+    if "__gfx90a__" not in cuh:  # the checkout's header may already carry the gfx90a fences
+        assert cuh.count(START_SYNC_OLD) == 1, "start_sync text changed; update ca_variant.py"
     # Write only what changed, so a second call (one per worker) finds the build up to date.
     _write(os.path.join(d, "custom_all_reduce.hip"),
            open(os.path.join(src, "custom_all_reduce.hip")).read())
