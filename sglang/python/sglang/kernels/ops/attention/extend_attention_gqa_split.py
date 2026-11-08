@@ -69,13 +69,14 @@ def _gqa_split_stage1(
     kvh = tl.program_id(1) % HKV
     c = tl.program_id(2)
 
-    q_start = tl.load(qo_indptr + seq)
-    n_ext = tl.load(qo_indptr + seq + 1) - q_start
+    # Indptrs may be int32 or int64; the branches below need one integer type.
+    q_start = tl.load(qo_indptr + seq).to(tl.int32)
+    n_ext = tl.load(qo_indptr + seq + 1).to(tl.int32) - q_start
     t0 = tile * BM_TOK
     if t0 >= n_ext:
         return
-    kv_start = tl.load(kv_indptr + seq)
-    n_pre = tl.load(kv_indptr + seq + 1) - kv_start
+    kv_start = tl.load(kv_indptr + seq).to(tl.int32)
+    n_pre = tl.load(kv_indptr + seq + 1).to(tl.int32) - kv_start
     C = tl.load(seq_meta + seq * 2)
     part_off = tl.load(seq_meta + seq * 2 + 1)
 
@@ -195,11 +196,11 @@ def _gqa_split_merge(
 ):
     seq = tl.program_id(0)
     t = tl.program_id(1)
-    q_start = tl.load(qo_indptr + seq)
-    n_ext = tl.load(qo_indptr + seq + 1) - q_start
+    q_start = tl.load(qo_indptr + seq).to(tl.int32)
+    n_ext = tl.load(qo_indptr + seq + 1).to(tl.int32) - q_start
     if t >= n_ext:
         return
-    n_pre = tl.load(kv_indptr + seq + 1) - tl.load(kv_indptr + seq)
+    n_pre = (tl.load(kv_indptr + seq + 1) - tl.load(kv_indptr + seq)).to(tl.int32)
     C = tl.load(seq_meta + seq * 2)
     part_off = tl.load(seq_meta + seq * 2 + 1)
     t_end = tl.minimum(n_ext, (t // BM_TOK) * BM_TOK + BM_TOK)
