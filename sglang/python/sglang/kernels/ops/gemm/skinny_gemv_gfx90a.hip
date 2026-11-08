@@ -401,6 +401,198 @@ __global__ void __launch_bounds__(256) skg_read_kernel(const u32x4* __restrict__
   if (a == 0x9e3779b9u) out[blockIdx.x] = a;  // keeps the loads alive
 }
 
+// ------------------------------------------------------------------------------------------
+// 4x4x4 MFMA variant (skf): v_mfma_f32_4x4x4bf16_1k runs 16 independent 4x4x4 blocks per
+// wave. Block b of every MFMA takes its own k chunk (lanes 4b..4b+3, one dwordx4 = 8 k per
+// lane, the two halves feeding two MFMAs), so one load instruction reads 4 weight rows x 256
+// contiguous bytes. x rows come in 4 groups of 4 (x padded to 16 rows: a row >= M re-reads row
+// M-1 and is never stored); a group whose rows are all >= M is skipped, which leaves every
+// other row's arithmetic unchanged. The 16 block partials of an output are summed in a fixed
+// order (DPP row_ror 4, 8, then xor 16, 32), the P wave parts in wave order through LDS.
+// DL selects the C/D lane layout: 0 = (m = q, n = lane%4), 1 = the transpose.
+
+template <int CTRL>
+DEVI float dpp_all(float v) {
+  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), CTRL, 0xF, 0xF, false));
+}
+
+DEVI float block_sum(float v) {
+  v += dpp_all<0x124>(v);  // row_ror:4
+  v += dpp_all<0x128>(v);  // row_ror:8
+  v += __shfl_xor(v, 16);
+  v += __shfl_xor(v, 32);
+  return v;  // lanes 0..3 hold the sums for n = lane
+}
+
+template <int R, int CH, int G, int P, int DL, bool HB>
+__global__ void __launch_bounds__(64 * G * P)
+    skf_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+               const uint16_t* __restrict__ bias, uint16_t* __restrict__ y, int M, int N, int sx,
+               int sy, int stag) {
+  constexpr int NSEG = CH * P;  // segments of 128 k
+  constexpr int K = NSEG * 128;
+  constexpr int RW = 4 * R;     // rows of w per wave
+  __shared__ float red[P > 1 ? G : 1][P > 1 ? P : 1][P > 1 ? 16 * RW : 1];
+  const int lane = threadIdx.x & 63;
+  const int j4 = lane & 3;
+  const int b = lane >> 2;
+  const int wave = threadIdx.x >> 6;
+  const int g = wave / P;
+  const int p = wave - g * P;
+  const int n0 = blockIdx.x * (G * RW) + g * RW;
+  const int rot = (int)((blockIdx.x * (unsigned)stag) % (unsigned)NSEG);
+  const int ngrp = (M + 3) >> 2;
+
+  u32x4 wv[R][CH];
+#pragma unroll
+  for (int j = 0; j < CH; ++j) {
+    int seg = p * CH + j + rot;
+    if (seg >= NSEG) seg -= NSEG;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const int n = min(n0 + r * 4 + j4, N - 1);
+      wv[r][j] = ldw<true>(reinterpret_cast<const u32x4*>(w + (size_t)n * K + seg * 128 + b * 8));
+    }
+  }
+  if constexpr (HB) __builtin_amdgcn_sched_barrier(0);
+
+  f32x4 acc[4][R];
+#pragma unroll
+  for (int mg = 0; mg < 4; ++mg) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[mg][r] = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
+    if (mg < ngrp) {
+      const int mrow = min(4 * mg + j4, M - 1);
+#pragma unroll
+      for (int j = 0; j < CH; ++j) {
+        int seg = p * CH + j + rot;
+        if (seg >= NSEG) seg -= NSEG;
+        const u32x4 xv =
+            *reinterpret_cast<const u32x4*>(x + (size_t)mrow * sx + seg * 128 + b * 8);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          acc[mg][r] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(lo_half(xv), lo_half(wv[r][j]),
+                                                              acc[mg][r], 0, 0, 0);
+          acc[mg][r] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(hi_half(xv), hi_half(wv[r][j]),
+                                                              acc[mg][r], 0, 0, 0);
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int mg = 0; mg < 4; ++mg) {
+    if (mg < ngrp) {
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const float v = block_sum(acc[mg][r][q]);
+          if (lane < 4) {
+            const int m = 4 * mg + (DL == 0 ? q : j4);
+            const int c = r * 4 + (DL == 0 ? j4 : q);
+            if constexpr (P == 1) {
+              const int n = n0 + c;
+              if (m < M && n < N) {
+                float s = v;
+                if (bias != nullptr) s += bf2f(bias[n]);
+                y[(size_t)m * sy + n] = f2bf(s);
+              }
+            } else {
+              red[g][p][m * RW + c] = v;
+            }
+          }
+        }
+    }
+  }
+  if constexpr (P > 1) {
+    __syncthreads();
+    for (int t = threadIdx.x; t < G * 16 * RW; t += 64 * G * P) {
+      const int c = t % RW;
+      const int m = (t / RW) % 16;
+      const int gg = t / (RW * 16);
+      const int n = blockIdx.x * (G * RW) + gg * RW + c;
+      if (m < M && n < N) {
+        float s = red[gg][0][m * RW + c];
+#pragma unroll
+        for (int q = 1; q < P; ++q) s += red[gg][q][m * RW + c];
+        if (bias != nullptr) s += bf2f(bias[n]);
+        y[(size_t)m * sy + n] = f2bf(s);
+      }
+    }
+  }
+}
+
+template <int R, int CH, int G, int P, int DL, bool HB>
+static int skf_launch_t(const void* x, const void* w, const void* b, void* y, int M, int N,
+                        int sx, int sy, int stag, hipStream_t s) {
+  constexpr int ROWS = G * R * 4;
+  hipLaunchKernelGGL((skf_kernel<R, CH, G, P, DL, HB>), dim3((N + ROWS - 1) / ROWS),
+                     dim3(64 * G * P), 0, s, (const uint16_t*)x, (const uint16_t*)w,
+                     (const uint16_t*)b, (uint16_t*)y, M, N, sx, sy, stag);
+  return (int)hipGetLastError();
+}
+
+// One config = (R, P, G, HB, NSEG, DL); K = 128 * NSEG.
+#define SKF_C(R, P, G, HB, NSEG, DL) \
+  {R, P, G, HB, NSEG, DL, &skf_launch_t<R, (NSEG) / (P), G, P, DL, (HB) != 0>},
+
+#ifdef SKG_SWEEP
+#define SKF_V(R, P, G, NSEG)                                                      \
+  SKF_C(R, P, G, 0, NSEG, 0) SKF_C(R, P, G, 0, NSEG, 1) SKF_C(R, P, G, 1, NSEG, 0) \
+      SKF_C(R, P, G, 1, NSEG, 1)
+#define SKF_TABLE                                                                      \
+  /* K = 2048 */                                                                       \
+  SKF_V(1, 4, 1, 16) SKF_V(2, 4, 1, 16) SKF_V(4, 4, 1, 16) SKF_V(1, 8, 1, 16)          \
+  SKF_V(2, 8, 1, 16) SKF_V(4, 8, 1, 16) SKF_V(1, 16, 1, 16) SKF_V(2, 16, 1, 16)        \
+  SKF_V(4, 16, 1, 16) SKF_V(1, 4, 2, 16) SKF_V(2, 4, 2, 16) SKF_V(4, 4, 2, 16)         \
+  SKF_V(1, 8, 2, 16) SKF_V(2, 8, 2, 16) SKF_V(4, 8, 2, 16)                             \
+  /* K = 256 */                                                                        \
+  SKF_V(1, 1, 1, 2) SKF_V(2, 1, 1, 2) SKF_V(4, 1, 1, 2) SKF_V(1, 2, 1, 2)              \
+  SKF_V(2, 2, 1, 2) SKF_V(4, 2, 1, 2) SKF_V(1, 1, 2, 2) SKF_V(2, 1, 2, 2)              \
+  SKF_V(4, 1, 2, 2) SKF_V(1, 2, 2, 2) SKF_V(2, 2, 2, 2) SKF_V(4, 2, 2, 2)
+#endif
+
+#ifdef SKF_TABLE
+static const SkqEntry kFTable[] = {SKF_TABLE};
+static const int kFTableLen = sizeof(kFTable) / sizeof(kFTable[0]);
+#else
+static const SkqEntry kFTable[1] = {{0, 0, 0, 0, 0, 0, nullptr}};
+static const int kFTableLen = 0;
+#endif
+
+extern "C" {
+
+int skf_count() { return kFTableLen; }
+
+int skf_entry(int i, int* out6) {
+  if (i < 0 || i >= kFTableLen) return -1;
+  const SkqEntry& e = kFTable[i];
+  out6[0] = e.r;
+  out6[1] = e.p;
+  out6[2] = e.g;
+  out6[3] = e.hb;
+  out6[4] = e.nseg;
+  out6[5] = e.dl;
+  return 0;
+}
+
+int skf_find(int r, int p, int g, int hb, int nseg, int dl) {
+  for (int i = 0; i < kFTableLen; ++i) {
+    const SkqEntry& e = kFTable[i];
+    if (e.r == r && e.p == p && e.g == g && e.hb == hb && e.nseg == nseg && e.dl == dl) return i;
+  }
+  return -1;
+}
+
+int skf_launch(int idx, const void* x, const void* w, const void* b, void* y, int M, int N,
+               int sx, int sy, int stag, void* stream) {
+  if (idx < 0 || idx >= kFTableLen) return -1;
+  return kFTable[idx].fn(x, w, b, y, M, N, sx, sy, stag, (hipStream_t)stream);
+}
+
+}  // extern "C"
+
 extern "C" {
 
 int skg_count() { return kTableLen; }

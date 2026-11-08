@@ -624,3 +624,238 @@ def main_q():
             f"M16 step {s16:.0f} vs {e16:.0f} ({100 * reg16:+.1f}%); worst per-shape M16 {100 * shape16:+.1f}%; "
             f"invariant {inv[key]}, replay {stress_ok} -> {'PASS' if passed else 'FAIL'}")
     return 0
+
+
+# ================================================== plan 18 step 1d: 4x4x4 MFMA (f) + per-shape mix
+def main_f():
+    """(f) 4x4x4 MFMA GEMV (4 rows x 256 B per load) on every shape; (q) j118's 16x16x16 on the
+    M=16-safe shapes; (mix) per shape the fastest at M=2 of e / q / f whose M=16 time is within
+    3% of e (one kernel per shape for every M). Compared with e (today) and r (read ceiling)."""
+    torch.manual_seed(0)
+    props = torch.cuda.get_device_properties(0)
+    log("device:", torch.cuda.get_device_name(0), props.gcnArchName, "CUs", props.multi_processor_count)
+    log("torch", torch.__version__, "hip", torch.version.hip, "triton", triton.__version__)
+    t0 = time.time()
+    lib = hg.build()
+    log(f"hip build+load {time.time() - t0:.1f}s: {lib.path}, {len(lib.q_entries)} q + {len(lib.f_entries)} f kernels")
+    ws = make_weights()
+    xs = {}
+    for m in MS_ALL:
+        for k in (2048, 256):
+            xs[(m, k)] = torch.randn(m, k, device=DEV).to(torch.bfloat16)
+    seq = layer_order()
+    tuned = {name: sk.default_config(n, k) for name, n, k, _ in SHAPES}
+    e_op = lambda x, w, name: sk.skinny_gemm(x, w, None, tuned[name], fused_reduce=True)
+
+    def mop(fam, cfg, idx):
+        return lambda x, w, _n: hg.mfma_gemv(lib, x, w, None, cfg, idx, fam)
+
+    def err_of(op, name, k, m):
+        w = ws[name][0]
+        x = xs[(m, k)]
+        ref = x.float() @ w.float().t()
+        return (op(x, w, name).float() - ref).abs().max().item()
+
+    # ---------------- C/D layout probe per family
+    dl_of = {}
+    for fam in ("q", "f"):
+        for dl in (0, 1):
+            good = True
+            for name, k in (("gdn_qkvz", 2048), ("shared_down", 256), ("gdn_ba", 2048)):
+                cfgs = lib.q_configs(k, dl, fam)
+                for cfg in (cfgs[0], cfgs[-1]):
+                    op = mop(fam, cfg, lib.q_find(cfg, k, fam))
+                    for m in (1, 3, 5, 16):
+                        eq, ee = err_of(op, name, k, m), err_of(e_op, name, k, m)
+                        if not eq <= 1.5 * ee + 1e-3:
+                            good = False
+            log(f"[probe] {fam} C/D layout dl={dl}: {'OK' if good else 'WRONG'}")
+            if good and fam not in dl_of:
+                dl_of[fam] = dl
+    if "f" not in dl_of:
+        log("[probe] f: no layout gives correct results; f is excluded")
+
+    # ---------------- sweeps
+    t0 = time.time()
+    e_t = {name: {m: per_shape(e_op, ws, xs, name, m) for m in (2, 16)} for name, *_ in SHAPES}
+    best = {}  # (fam, (n, k)) -> (cfg, idx, t2, t16)
+    for fam in dl_of:
+        for (n, k), names in NAME_OF.items():
+            name = names[0]
+            rows = []
+            for cfg in lib.q_configs(k, dl_of[fam], fam):
+                idx = lib.q_find(cfg, k, fam)
+                op = mop(fam, cfg, idx)
+                try:
+                    t2 = per_shape(op, ws, xs, name, 2)
+                    t16 = per_shape(op, ws, xs, name, 16)
+                except Exception as ex:  # noqa: BLE001
+                    log(f"{fam} cfg fail", name, cfg, repr(ex)[:300])
+                    continue
+                rows.append((t2, t16, cfg, idx))
+            lim16 = 1.03 * e_t[name][16]
+            ok = sorted([r for r in rows if r[1] <= lim16], key=lambda r: r[0])
+            by_score = sorted(rows, key=lambda r: r[0] + 0.25 * r[1])
+            log(f"[sweep {fam}] {name} N={n} K={k}: {len(rows)} configs; e M2={e_t[name][2]:.2f} "
+                f"M16={e_t[name][16]:.2f}; {len(ok)} within M16 <= {lim16:.2f}")
+            for r in ok[:4]:
+                log(f"   ok    M2={r[0]:.2f}us M16={r[1]:.2f}us {tuple(r[2])}")
+            for r in by_score[:3]:
+                log(f"   score M2={r[0]:.2f}us M16={r[1]:.2f}us {tuple(r[2])}")
+            for r in (ok if ok else by_score)[:6]:
+                v = invariant(mop(fam, r[2], r[3]), ws, xs, name, k, reps=10)
+                if v == "ok":
+                    best[(fam, (n, k))] = r
+                    break
+                log(f"   {tuple(r[2])} rejected: {v}")
+    log(f"sweeps took {time.time() - t0:.0f}s")
+
+    # per-shape choice: the fastest at M=2 among e and the M16-safe q / f picks
+    choice = {}
+    for (n, k), names in NAME_OF.items():
+        name = names[0]
+        pick = ("e", None, None, e_t[name][2])
+        for fam in ("q", "f"):
+            r = best.get((fam, (n, k)))
+            if r and r[1] <= 1.03 * e_t[name][16] and r[0] < pick[3]:
+                pick = (fam, r[2], r[3], r[0])
+        choice[(n, k)] = pick
+
+    def fam_all(fam):
+        def op(x, w, name):
+            r = best.get((fam, tuple(w.shape)))
+            if r is None:
+                return e_op(x, w, name)
+            return hg.mfma_gemv(lib, x, w, None, r[2], r[3], fam)
+        return op
+
+    def q_safe(x, w, name):
+        r = best.get(("q", tuple(w.shape)))
+        if r is None or not (r[1] <= 1.03 * e_t[NAME_OF[tuple(w.shape)][0]][16] and r[0] < e_t[NAME_OF[tuple(w.shape)][0]][2]):
+            return e_op(x, w, name)
+        return hg.mfma_gemv(lib, x, w, None, r[2], r[3], "q")
+
+    def mix(x, w, name):
+        fam, cfg, idx, _ = choice[tuple(w.shape)]
+        if fam == "e":
+            return e_op(x, w, name)
+        return hg.mfma_gemv(lib, x, w, None, cfg, idx, fam)
+
+    ops = {"e": e_op, "q": q_safe, "mix": mix}
+    if "f" in dl_of:
+        ops["f_all"] = fam_all("f")
+    keys = list(ops)
+    res = {key: {"shape": {(name, m): per_shape(ops[key], ws, xs, name, m) for m in MS_SHAPE for name, *_ in SHAPES},
+                 "step": {}, "err": {}} for key in keys}
+    r_us = {name: read_us(lib, ws[name]) for name, *_ in SHAPES}
+    log("mix choice:", {NAME_OF[nk][0]: (c[0], tuple(c[1]) if c[1] else None) for nk, c in choice.items()})
+
+    # ---------------- correctness
+    inv = {}
+    for key in keys:
+        bad = []
+        for name, n, k, _ in SHAPES:
+            v = invariant(ops[key], ws, xs, name, k, reps=100)
+            if v != "ok":
+                bad.append(f"{name}: {v}")
+        inv[key] = not bad
+        log(f"[check] {key}: bitwise batch-invariant (M=1..16, contiguous and view) and 100 repeats: {not bad} {bad}")
+    for key in keys:
+        for m in (1, 2, 16):
+            res[key]["err"][m] = max(max_err(ops[key], ws, xs, name, k, m) for name, n, k, _ in SHAPES)
+    bias_ok = True
+    for (fam, (n, k)), r in best.items():
+        name = NAME_OF[(n, k)][0]
+        w = ws[name][0]
+        b = (torch.randn(n, device=DEV) * 0.1).to(torch.bfloat16)
+        for m in (1, 3, 16):
+            x = xs[(m, k)]
+            ref = x.float() @ w.float().t() + b.float()
+            eq = (hg.mfma_gemv(lib, x, w, b, r[2], r[3], fam).float() - ref).abs().max().item()
+            ee = (sk.skinny_gemm(x, w, b, tuned[name]).float() - ref).abs().max().item()
+            if eq > 1.5 * ee + 1e-3:
+                bias_ok = False
+                log(f"[check] {fam} bias err above e: N={n} K={k} M={m}: {eq:.4g} vs {ee:.4g}")
+    log(f"[check] bias path within e's error: {bias_ok}")
+    stress = {}
+    for key in [k for k in keys if k != "e"]:
+        ok_ = True
+        for name, n, k, _ in SHAPES:
+            wl = ws[name]
+            for m in (2, 16):
+                xin = torch.randn(m, k, device=DEV).to(torch.bfloat16)
+                outs = []
+
+                def fn():
+                    outs.clear()
+                    for w in wl:
+                        outs.append(ops[key](xin, w, name))
+
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    fn()
+                torch.cuda.current_stream().wait_stream(s)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    fn()
+                for it in range(10):
+                    xin.copy_(torch.randn(m, k, device=DEV))
+                    g.replay()
+                    torch.cuda.synchronize()
+                    for i in (0, len(wl) - 1):
+                        if not torch.equal(outs[i], ops[key](xin, wl[i], name)):
+                            ok_ = False
+                del g
+        stress[key] = ok_
+        log(f"[check] {key} graph replay with fresh inputs == eager: {ok_}")
+
+    # ---------------- step graphs
+    for key in keys:
+        for m in MS_ALL:
+            res[key]["step"][m] = step(ops[key], ws, xs, m, seq)
+        log(f"[{key}] step us: " + ", ".join(f"M{m}={v:.0f}" for m, v in res[key]["step"].items()))
+    for key in keys:
+        log(f"[{key}] step M=2 repeat timings: {[round(step(ops[key], ws, xs, 2, seq)) for _ in range(2)]}")
+
+    # ---------------- tables
+    log("\n## per-shape us/call and GB/s (graph replay, own weight per call); r = read ceiling")
+    for m in MS_SHAPE:
+        log(f"\nM={m}")
+        log(" | ".join(["shape", "N", "K", "calls"] + [f"{k} us" for k in keys] + ["r us"] + [f"{k} GB/s" for k in keys] + ["r GB/s"]))
+        for name, n, k, cnt in SHAPES:
+            us = [res[key]["shape"][(name, m)] for key in keys] + [r_us[name]]
+            log(" | ".join([name, str(n), str(k), str(cnt)] + [f"{u:.2f}" for u in us] + [f"{wbytes(n, k, m) / u / 1e3:.0f}" for u in us]))
+        log(" | ".join(["sum(count*us)", "", "", "230"] + [
+            f"{sum(res[key]['shape'][(nm, m)] * c for nm, _, _, c in SHAPES):.0f}" for key in keys]
+            + [f"{sum(r_us[nm] * c for nm, _, _, c in SHAPES):.0f}"]))
+    log("\n## 230-call step graph us by M")
+    log(" | ".join(["M"] + keys))
+    for m in MS_ALL:
+        log(" | ".join([str(m)] + [f"{res[k]['step'][m]:.0f}" for k in keys]))
+    log("\n## max abs err vs fp32 reference")
+    for k in keys:
+        log(k, {m: round(v, 4) for m, v in res[k]["err"].items()})
+    log(f"\nlayouts: {dl_of}")
+    log("BEST (fam, (N, K)): M2 us, M16 us, config")
+    for (fam, nk), r in sorted(best.items()):
+        log(f"    {fam} {nk}: {r[0]:.2f} {r[1]:.2f} {tuple(r[2])}  # {NAME_OF[nk]}")
+    log("MIX_TUNED = {")
+    for nk, c in choice.items():
+        log(f"    {nk}: {(c[0], tuple(c[1]) if c[1] else None)},  # {NAME_OF[nk]}")
+    log("}")
+
+    # ---------------- gate
+    e2, e16 = res["e"]["step"][2], res["e"]["step"][16]
+    log("\nGATE @M=2 (vs e):")
+    for key in [k for k in keys if k != "e"]:
+        s2, s16 = res[key]["step"][2], res[key]["step"][16]
+        qk = res[key]["shape"][("gdn_qkvz", 2)]
+        reg16 = s16 / e16 - 1
+        shape16 = max(res[key]["shape"][(nm, 16)] / res["e"]["shape"][(nm, 16)] - 1 for nm, *_ in SHAPES)
+        passed = inv[key] and stress[key] and (e2 - s2) >= 600 and qk <= 25 and reg16 <= 0.05 and shape16 <= 0.05
+        log(f"  {key}: step M2 {s2:.0f} vs {e2:.0f} us, saving {(e2 - s2) / 1000:.3f} ms; qkvz {qk:.2f} us; "
+            f"M16 step {s16:.0f} vs {e16:.0f} ({100 * reg16:+.1f}%); worst per-shape M16 {100 * shape16:+.1f}%; "
+            f"invariant {inv[key]}, replay {stress[key]} -> {'PASS' if passed else 'FAIL'}")
+    return 0

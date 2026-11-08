@@ -42,6 +42,10 @@ class GemvConfig(NamedTuple):
         return k == nseg * self.lpr * 8
 
 
+# K per segment: "q" = 16x16x16 MFMA (16 rows x 64 B per load), "f" = 4x4x4 MFMA (4 rows x 256 B).
+SEG_K = {"q": 32, "f": 128}
+
+
 class MfmaConfig(NamedTuple):
     rows: int  # R: 16-row tiles of w per wave
     kparts: int  # P: waves splitting K for one tile group
@@ -50,8 +54,6 @@ class MfmaConfig(NamedTuple):
     dl: int = 0  # MFMA C/D lane layout (0 or 1; the bench probes which one is right)
     stag: int = 0  # K-start rotation per workgroup (0 = off)
 
-    def nseg(self, k: int) -> int:
-        return k // 32
 
 
 def _cache_dir() -> str:
@@ -83,6 +85,10 @@ class GemvLib:
         lib.skq_entry.argtypes = [ci, ctypes.POINTER(ci)]
         lib.skq_find.argtypes = [ci] * 6
         lib.skq_launch.argtypes = [ci, vp, vp, vp, vp, ci, ci, ci, ci, ci, vp]
+        lib.skf_count.restype = ci
+        lib.skf_entry.argtypes = [ci, ctypes.POINTER(ci)]
+        lib.skf_find.argtypes = [ci] * 6
+        lib.skf_launch.argtypes = [ci, vp, vp, vp, vp, ci, ci, ci, ci, ci, vp]
         self.lib = lib
         self.path = path
         self.entries = []
@@ -95,6 +101,10 @@ class GemvLib:
         for i in range(lib.skq_count()):
             lib.skq_entry(i, qbuf)
             self.q_entries.append(tuple(qbuf))
+        self.f_entries = []
+        for i in range(lib.skf_count()):
+            lib.skf_entry(i, qbuf)
+            self.f_entries.append(tuple(qbuf))
 
     def find(self, mb: int, cfg: GemvConfig, k: int) -> int:
         return self.lib.skg_find(mb, cfg.rows, cfg.kparts, cfg.groups, cfg.nt, cfg.nseg(k), cfg.lpr)
@@ -108,14 +118,16 @@ class GemvLib:
         ]
 
 
-    def q_find(self, cfg: MfmaConfig, k: int) -> int:
-        return self.lib.skq_find(cfg.rows, cfg.kparts, cfg.groups, cfg.hoist, cfg.nseg(k), cfg.dl)
+    def q_find(self, cfg: MfmaConfig, k: int, fam: str = "q") -> int:
+        find = self.lib.skq_find if fam == "q" else self.lib.skf_find
+        return find(cfg.rows, cfg.kparts, cfg.groups, cfg.hoist, k // SEG_K[fam], cfg.dl)
 
-    def q_configs(self, k: int, dl: int) -> list[MfmaConfig]:
+    def q_configs(self, k: int, dl: int, fam: str = "q") -> list[MfmaConfig]:
+        entries = self.q_entries if fam == "q" else self.f_entries
         return [
             MfmaConfig(r, p, g, hb, d)
-            for r, p, g, hb, ns, d in self.q_entries
-            if ns * 32 == k and d == dl
+            for r, p, g, hb, ns, d in entries
+            if ns * SEG_K[fam] == k and d == dl
         ]
 
 
@@ -174,13 +186,14 @@ def gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Te
 
 
 def mfma_gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor],
-              cfg: MfmaConfig, idx: int) -> torch.Tensor:
+              cfg: MfmaConfig, idx: int, fam: str = "q") -> torch.Tensor:
     """y = x @ w.T + bias through the MFMA kernel ``idx`` (``lib.q_find(cfg, K)``); x [M <= 16, K]
     with unit inner stride and 16-byte aligned rows, w contiguous [N, K]."""
     M, K = x.shape
     N = w.shape[0]
     y = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    rc = lib.lib.skq_launch(
+    launch = lib.lib.skq_launch if fam == "q" else lib.lib.skf_launch
+    rc = launch(
         idx, x.data_ptr(), w.data_ptr(), bias.data_ptr() if bias is not None else None,
         y.data_ptr(), M, N, x.stride(0), N, cfg.stag,
         torch.cuda.current_stream().cuda_stream,
