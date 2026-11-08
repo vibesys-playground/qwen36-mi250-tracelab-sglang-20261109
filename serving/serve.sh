@@ -39,6 +39,6 @@ exec python3 -m sglang.launch_server "$@" \
   --load-balance-method prefix_affinity \
   --attention-backend triton \
   --cuda-graph-backend-prefill breakable \
-  --cuda-graph-max-bs-prefill 1024 \
+  --cuda-graph-max-bs-prefill 2816 \
   --enable-cache-report \
   --default-chat-template-kwargs '{"enable_thinking": false}'
