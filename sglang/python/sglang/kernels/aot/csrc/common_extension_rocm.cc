@@ -85,6 +85,27 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("deterministic_all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()");
   m.impl("deterministic_all_reduce_unreg", torch::kCUDA, &deterministic_all_reduce_unreg);
 
+  /*
+   * From csrc/moe: one-launch decode MoE block for gfx90a (Qwen3.5/3.6-MoE, M <= 8)
+   */
+  extern void hip_decode_moe_block(
+      torch::Tensor& x,
+      torch::Tensor& w_router,
+      torch::Tensor& w_sgu,
+      torch::Tensor& w_sgate,
+      torch::Tensor& w_sdown,
+      torch::Tensor& w13,
+      torch::Tensor& w2,
+      torch::Tensor& out,
+      torch::Tensor& ws,
+      int64_t grid);
+  extern int64_t hip_decode_moe_block_max_grid(int64_t m);
+  m.def(
+      "hip_decode_moe_block(Tensor x, Tensor w_router, Tensor w_sgu, Tensor w_sgate, Tensor w_sdown, "
+      "Tensor w13, Tensor w2, Tensor! out, Tensor! ws, int grid) -> ()");
+  m.impl("hip_decode_moe_block", torch::kCUDA, &hip_decode_moe_block);
+  m.def("hip_decode_moe_block_max_grid", &hip_decode_moe_block_max_grid);
+
   m.def("dispose", &dispose);
 
   m.def("meta_size", &meta_size);

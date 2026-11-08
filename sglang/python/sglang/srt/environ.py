@@ -1118,6 +1118,9 @@ class Envs:
     SGLANG_ROCM_DISABLE_SKINNY_GEMV = EnvBool(False)
     # gfx90a: Qwen3.5 attention prologue (QK Gemma RMSNorm + mrope + gate) as one Triton kernel.
     SGLANG_HIP_FUSED_QK_ROPE_GATE = EnvBool(True)
+    # One-launch decode MoE block on gfx90a for BF16 Qwen3.5/3.6-MoE at decode M <= 4
+    # (kernels/aot/csrc/moe/hip_decode_moe_block.hip). Set to 0 to use the per-op path.
+    SGLANG_HIP_DECODE_MEGAKERNEL = EnvBool(True)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
