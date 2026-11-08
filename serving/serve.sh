@@ -32,6 +32,11 @@ fi
 #   drafts 2 tokens per step as a topk=1 chain and the target verifies all 3 positions in one
 #   forward. Temperature-0 requests verify greedily (accept only the target's argmax), so the
 #   emitted tokens are the target's greedy tokens.
+# Deterministic (batch-invariant) inference: fixed attention split tiles, one MoE kernel
+#   config and greedy verify, so a token's logits do not depend on what else is in its batch
+#   or on how much of its prompt came from the radix cache. Without it, MTP made a repeated
+#   temperature-0 prompt diverge in 3 of 20 sends when the cache was kept (diagnostic j48).
+#   On ROCm it requires TP <= 2 when custom all-reduce is off, which this layout has.
 exec python3 -m sglang.launch_server "$@" \
   --tp-size 2 \
   --dp-size 4 \
@@ -43,4 +48,5 @@ exec python3 -m sglang.launch_server "$@" \
   --speculative-algorithm NEXTN \
   --speculative-num-steps 2 \
   --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 3
+  --speculative-num-draft-tokens 3 \
+  --enable-deterministic-inference
