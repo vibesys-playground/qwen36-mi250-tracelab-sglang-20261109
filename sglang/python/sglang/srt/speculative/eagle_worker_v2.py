@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from typing import Callable, List, Optional
 
@@ -203,6 +204,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         self._rebuild_topk1_chain_buffers()
+
+        # DEBUG ONLY, never set when serving: replace this fraction of draft tokens
+        # with wrong ones before verify, to test that greedy outputs do not depend
+        # on the drafts. A fixed-seed CPU generator keeps both TP ranks in step.
+        self._debug_corrupt_p = float(
+            os.environ.get("SGLANG_SPEC_DEBUG_CORRUPT_DRAFT", "0") or 0
+        )
+        self._debug_corrupt_gen = torch.Generator().manual_seed(1234)
+        if self._debug_corrupt_p > 0:
+            logger.warning(
+                "SGLANG_SPEC_DEBUG_CORRUPT_DRAFT=%s: corrupting draft tokens (debug)",
+                self._debug_corrupt_p,
+            )
 
         # Use the same attention topology during draft construction and execution.
         self.parallel_layout = resolve_draft_parallel_layout(
@@ -689,6 +703,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    def _debug_corrupt_drafts(self, draft_tokens: torch.Tensor) -> torch.Tensor:
+        shape = draft_tokens.shape
+        hit = torch.rand(shape, generator=self._debug_corrupt_gen) < self._debug_corrupt_p
+        shift = torch.randint(1, 1000, shape, generator=self._debug_corrupt_gen)
+        hit, shift = hit.to(draft_tokens.device), shift.to(draft_tokens.device)
+        vocab = self.target_worker.model_config.vocab_size
+        wrong = (draft_tokens.to(torch.int64) + shift) % vocab
+        return torch.where(hit, wrong.to(draft_tokens.dtype), draft_tokens)
+
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
@@ -754,6 +777,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
+        if self._debug_corrupt_p > 0 and not forward_batch.forward_mode.is_idle():
+            draft_tokens = self._debug_corrupt_drafts(draft_tokens)
         verify_input = build_eagle_verify_input(
             batch,
             draft_input,
