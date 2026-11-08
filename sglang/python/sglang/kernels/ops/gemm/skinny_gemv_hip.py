@@ -43,7 +43,7 @@ class GemvConfig(NamedTuple):
 
 
 # K per segment: "q" = 16x16x16 MFMA (16 rows x 64 B per load), "f" = 4x4x4 MFMA (4 rows x 256 B).
-SEG_K = {"q": 32, "f": 128}
+SEG_K = {"q": 32, "f": 128, "f2": 128}
 
 
 class MfmaConfig(NamedTuple):
@@ -54,6 +54,18 @@ class MfmaConfig(NamedTuple):
     dl: int = 0  # MFMA C/D lane layout (0 or 1; the bench probes which one is right)
     stag: int = 0  # K-start rotation per workgroup (0 = off)
 
+
+
+class F2Config(NamedTuple):
+    """skf2: the 4x4x4 MFMA GEMV with a reduce-scatter (red=1) and up to 8 row tiles per wave."""
+
+    rows: int  # R: 4-row tiles of w per wave
+    kparts: int  # P: waves splitting K for one tile group
+    groups: int  # G: tile groups per workgroup
+    hoist: int = 0  # 1: issue every weight load before the first MFMA
+    red: int = 1  # 1: reduce-scatter across blocks, 0: per-value butterfly
+    diag: int = 0  # timing-only variants (wrong results): 1 no exchange, 2 one x load
+    stag: int = 0
 
 
 def _cache_dir() -> str:
@@ -89,6 +101,10 @@ class GemvLib:
         lib.skf_entry.argtypes = [ci, ctypes.POINTER(ci)]
         lib.skf_find.argtypes = [ci] * 6
         lib.skf_launch.argtypes = [ci, vp, vp, vp, vp, ci, ci, ci, ci, ci, vp]
+        lib.skf2_count.restype = ci
+        lib.skf2_entry.argtypes = [ci, ctypes.POINTER(ci)]
+        lib.skf2_find.argtypes = [ci] * 7
+        lib.skf2_launch.argtypes = [ci, vp, vp, vp, vp, ci, ci, ci, ci, ci, vp]
         self.lib = lib
         self.path = path
         self.entries = []
@@ -105,6 +121,11 @@ class GemvLib:
         for i in range(lib.skf_count()):
             lib.skf_entry(i, qbuf)
             self.f_entries.append(tuple(qbuf))
+        self.f2_entries = []
+        f2buf = (ci * 7)()
+        for i in range(lib.skf2_count()):
+            lib.skf2_entry(i, f2buf)
+            self.f2_entries.append(tuple(f2buf))
 
     def find(self, mb: int, cfg: GemvConfig, k: int) -> int:
         return self.lib.skg_find(mb, cfg.rows, cfg.kparts, cfg.groups, cfg.nt, cfg.nseg(k), cfg.lpr)
@@ -118,7 +139,10 @@ class GemvLib:
         ]
 
 
-    def q_find(self, cfg: MfmaConfig, k: int, fam: str = "q") -> int:
+    def q_find(self, cfg, k: int, fam: str = "q") -> int:
+        if fam == "f2":
+            return self.lib.skf2_find(cfg.rows, cfg.kparts, cfg.groups, cfg.hoist, k // SEG_K[fam],
+                                      cfg.red, cfg.diag)
         find = self.lib.skq_find if fam == "q" else self.lib.skf_find
         return find(cfg.rows, cfg.kparts, cfg.groups, cfg.hoist, k // SEG_K[fam], cfg.dl)
 
@@ -131,6 +155,26 @@ class GemvLib:
         ]
 
 
+    def f2_configs(self, k: int, diag: int = 0) -> list[F2Config]:
+        return [
+            F2Config(r, p, g, hb, red, dg)
+            for r, p, g, hb, ns, red, dg in self.f2_entries
+            if ns * 128 == k and dg == diag
+        ]
+
+
+# Arbitrary bound: the production table builds in a few seconds, the full sweep in under a minute.
+BUILD_TIMEOUT_S = 300
+
+
+def _hipcc_version(hipcc: str) -> str:
+    try:
+        r = subprocess.run([hipcc, "--version"], capture_output=True, text=True, timeout=60)
+        return r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 def build(defines: tuple[str, ...] = ("-DSKG_SWEEP",)) -> GemvLib:
     hipcc = _hipcc()
     if hipcc is None:
@@ -140,6 +184,8 @@ def build(defines: tuple[str, ...] = ("-DSKG_SWEEP",)) -> GemvLib:
              "-Wno-unused-result", *defines]
     h = hashlib.sha256(open(_SRC, "rb").read())
     h.update(" ".join(flags).encode())
+    h.update(_hipcc_version(hipcc).encode())
+    h.update(str(torch.version.hip).encode())
     d = _cache_dir()
     so = os.path.join(d, f"skinny_gemv_{h.hexdigest()[:16]}.so")
     if not os.path.exists(so):
@@ -149,7 +195,11 @@ def build(defines: tuple[str, ...] = ("-DSKG_SWEEP",)) -> GemvLib:
                 if not os.path.exists(so):
                     tmp = f"{so}.{os.getpid()}.tmp"
                     t0 = time.time()
-                    r = subprocess.run([hipcc, *flags, "-o", tmp, _SRC], capture_output=True, text=True)
+                    try:
+                        r = subprocess.run([hipcc, *flags, "-o", tmp, _SRC], capture_output=True,
+                                           text=True, timeout=BUILD_TIMEOUT_S)
+                    except subprocess.TimeoutExpired as e:
+                        raise RuntimeError(f"hipcc timed out after {BUILD_TIMEOUT_S}s") from e
                     if r.returncode != 0:
                         raise RuntimeError(f"hipcc failed ({r.returncode}): {r.stderr[-3000:]}")
                     os.replace(tmp, so)
@@ -186,13 +236,13 @@ def gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Te
 
 
 def mfma_gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor],
-              cfg: MfmaConfig, idx: int, fam: str = "q") -> torch.Tensor:
+              cfg, idx: int, fam: str = "q") -> torch.Tensor:
     """y = x @ w.T + bias through the MFMA kernel ``idx`` (``lib.q_find(cfg, K)``); x [M <= 16, K]
     with unit inner stride and 16-byte aligned rows, w contiguous [N, K]."""
     M, K = x.shape
     N = w.shape[0]
     y = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    launch = lib.lib.skq_launch if fam == "q" else lib.lib.skf_launch
+    launch = {"q": lib.lib.skq_launch, "f": lib.lib.skf_launch, "f2": lib.lib.skf2_launch}[fam]
     rc = launch(
         idx, x.data_ptr(), w.data_ptr(), bias.data_ptr() if bias is not None else None,
         y.data_ptr(), M, N, x.stride(0), N, cfg.stag,
@@ -203,15 +253,17 @@ def mfma_gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[tor
     return y
 
 
-def table_defines(entries: list[tuple[str, MfmaConfig, int]]) -> tuple[str, ...]:
+def table_defines(entries: list[tuple[str, object, int]]) -> tuple[str, ...]:
     """hipcc -D flags that instantiate only the given (family, config, K) kernels."""
-    q, f = [], []
+    tables: dict[str, list[str]] = {"q": [], "f": [], "f2": []}
     for fam, cfg, k in entries:
-        args = f"{cfg.rows},{cfg.kparts},{cfg.groups},{cfg.hoist},{k // SEG_K[fam]},{cfg.dl}"
-        (q if fam == "q" else f).append(f"SKQ_C({args})" if fam == "q" else f"SKF_C({args})")
-    out = []
-    if q:
-        out.append("-DSKQ_TABLE=" + " ".join(sorted(set(q))))
-    if f:
-        out.append("-DSKF_TABLE=" + " ".join(sorted(set(f))))
-    return tuple(out)
+        nseg = k // SEG_K[fam]
+        if fam == "f2":
+            args = f"{cfg.rows},{cfg.kparts},{cfg.groups},{cfg.hoist},{nseg},{cfg.red},{cfg.diag}"
+        else:
+            args = f"{cfg.rows},{cfg.kparts},{cfg.groups},{cfg.hoist},{nseg},{cfg.dl}"
+        tables[fam].append(f"{_MACRO[fam]}_C({args})")
+    return tuple(f"-D{_MACRO[fam]}_TABLE=" + " ".join(sorted(set(v))) for fam, v in tables.items() if v)
+
+
+_MACRO = {"q": "SKQ", "f": "SKF", "f2": "SKF2"}

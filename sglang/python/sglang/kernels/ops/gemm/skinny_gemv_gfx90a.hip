@@ -198,7 +198,7 @@ struct SkgEntry {
       SKG_E(4, R, P, G, NT, NSEG, LPR) SKG_E(8, R, P, G, NT, NSEG, LPR)      \
           SKG_E(16, R, P, G, NT, NSEG, LPR)
 
-#ifdef SKG_SWEEP
+#if defined(SKG_SWEEP) && !defined(SKG_NO_SCALAR)
 // LPR 64 (K = 2048) and LPR 8 with NSEG 4 (K = 256): R x P x G
 #define SKG_RPG(NSEG, LPR)                                                                     \
   SKG_C(1, 1, 1, 1, NSEG, LPR) SKG_C(2, 1, 1, 1, NSEG, LPR) SKG_C(4, 1, 1, 1, NSEG, LPR)      \
@@ -560,6 +560,265 @@ static const int kFTableLen = sizeof(kFTable) / sizeof(kFTable[0]);
 static const SkqEntry kFTable[1] = {{0, 0, 0, 0, 0, 0, nullptr}};
 static const int kFTableLen = 0;
 #endif
+
+// ------------------------------------------------------------------------------------------
+// skf2: the 4x4x4 MFMA GEMV with (A) one fixed-order reduce-scatter across the 16 blocks per
+// m-group instead of a 16-way butterfly per value, and (B) m-groups processed one at a time
+// (only R x 4 accumulators live), so R can grow to 8 and one x load feeds 2R MFMAs.
+// Every output's reduction tree is fixed: stages pair lanes at xor 8, 4, 16, 32 in that order
+// (IEEE add is commutative, so either lane of a pair holds the same bits), whatever M is.
+// RED = 0 keeps skf's per-value butterfly (for comparison). DIAG (timing only, wrong
+// results): 1 = no cross-lane exchange, 2 = one x load reused by every m-group.
+
+template <int D>
+DEVI float xchg(float v) {
+  if constexpr (D == 8) {
+    return dpp_all<0x128>(v);  // row_ror:8 == lane ^ 8 inside a 16-lane row
+  } else if constexpr (D == 32) {
+    return __shfl_xor(v, 32);
+  } else {
+    return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x1F | (D << 10)));
+  }
+}
+
+// One stage over lane bit D on N live values: halve them (N >= 2) or butterfly (N == 1).
+template <int D, int N, bool NOX>
+DEVI void rs_stage(float* v, int lane) {
+  const bool hi = (lane & D) != 0;
+  if constexpr (N >= 2) {
+    constexpr int H = N / 2;
+#pragma unroll
+    for (int i = 0; i < H; ++i) {
+      const float send = hi ? v[i] : v[i + H];
+      const float keep = hi ? v[i + H] : v[i];
+      v[i] = NOX ? keep : keep + xchg<D>(send);
+    }
+  } else {
+    if constexpr (!NOX) v[0] = v[0] + xchg<D>(v[0]);
+  }
+}
+
+// Reduce-scatter of V values over the 16 blocks (lane bits 2..5). Afterwards v[0..NF) hold the
+// sums of original indices idx .. idx + NF - 1; writer is false on the duplicate lanes.
+template <int V, bool NOX>
+DEVI void reduce_scatter(float* v, int lane, int& idx, bool& writer) {
+  constexpr int N1 = V, N2 = V > 1 ? V / 2 : 1, N3 = N2 > 1 ? N2 / 2 : 1, N4 = N3 > 1 ? N3 / 2 : 1;
+  rs_stage<8, N1, NOX>(v, lane);
+  rs_stage<4, N2, NOX>(v, lane);
+  rs_stage<16, N3, NOX>(v, lane);
+  rs_stage<32, N4, NOX>(v, lane);
+  idx = 0;
+  writer = true;
+  const int ds[4] = {8, 4, 16, 32};
+  const int ns[4] = {N1, N2, N3, N4};
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    if (ns[s] >= 2) {
+      if (lane & ds[s]) idx += ns[s] / 2;
+    } else if (lane & ds[s]) {
+      writer = false;
+    }
+  }
+}
+
+template <int R, int CH, int G, int P, bool HB, int RED, int DIAG>
+__global__ void __launch_bounds__(64 * G * P)
+    skf2_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+                const uint16_t* __restrict__ bias, uint16_t* __restrict__ y, int M, int N, int sx,
+                int sy, int stag) {
+  constexpr int NSEG = CH * P;  // segments of 128 k
+  constexpr int K = NSEG * 128;
+  constexpr int RW = 4 * R;     // rows of w per wave
+  constexpr int V = 4 * R;      // values per lane per m-group
+  constexpr int NF = V >= 16 ? V / 16 : 1;
+  __shared__ float red[P > 1 ? G : 1][P > 1 ? P : 1][P > 1 ? 16 * RW : 1];
+  const int lane = threadIdx.x & 63;
+  const int j4 = lane & 3;
+  const int b = lane >> 2;
+  const int wave = threadIdx.x >> 6;
+  const int g = wave / P;
+  const int p = wave - g * P;
+  const int n0 = blockIdx.x * (G * RW) + g * RW;
+  const int ngrp = (M + 3) >> 2;
+
+  u32x4 wv[R][CH];
+#pragma unroll
+  for (int j = 0; j < CH; ++j)
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const int n = min(n0 + r * 4 + j4, N - 1);
+      wv[r][j] = ldw<true>(
+          reinterpret_cast<const u32x4*>(w + (size_t)n * K + (p * CH + j) * 128 + b * 8));
+    }
+  if constexpr (HB) __builtin_amdgcn_sched_barrier(0);
+  u32x4 xv0[CH];
+  if constexpr (DIAG == 2) {
+    const int mrow = min(j4, M - 1);
+#pragma unroll
+    for (int j = 0; j < CH; ++j)
+      xv0[j] = *reinterpret_cast<const u32x4*>(x + (size_t)mrow * sx + (p * CH + j) * 128 + b * 8);
+  }
+
+  auto emit = [&](int m, int c, float v) {
+    if constexpr (P == 1) {
+      const int n = n0 + c;
+      if (m < M && n < N) {
+        if (bias != nullptr) v += bf2f(bias[n]);
+        y[(size_t)m * sy + n] = f2bf(v);
+      }
+    } else {
+      red[g][p][m * RW + c] = v;
+    }
+  };
+
+#pragma unroll 1
+  for (int mg = 0; mg < 4; ++mg) {
+    if (mg >= ngrp) break;
+    f32x4 acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
+    const int mrow = min(4 * mg + j4, M - 1);
+#pragma unroll
+    for (int j = 0; j < CH; ++j) {
+      u32x4 xv;
+      if constexpr (DIAG == 2) {
+        xv = xv0[j];
+      } else {
+        xv = *reinterpret_cast<const u32x4*>(x + (size_t)mrow * sx + (p * CH + j) * 128 + b * 8);
+      }
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        acc[r] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(lo_half(xv), lo_half(wv[r][j]), acc[r],
+                                                        0, 0, 0);
+        acc[r] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(hi_half(xv), hi_half(wv[r][j]), acc[r],
+                                                        0, 0, 0);
+      }
+    }
+    if constexpr (RED == 0) {
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const float v = DIAG == 1 ? acc[r][q] : block_sum(acc[r][q]);
+          if (lane < 4) emit(4 * mg + q, r * 4 + j4, v);
+        }
+    } else {
+      float v[V];
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) v[r * 4 + q] = acc[r][q];
+      int idx;
+      bool writer;
+      reduce_scatter<V, DIAG == 1>(v, lane, idx, writer);
+      if (writer) {
+#pragma unroll
+        for (int i = 0; i < NF; ++i) {
+          const int vi = idx + i;
+          emit(4 * mg + (vi & 3), (vi >> 2) * 4 + j4, v[i]);
+        }
+      }
+    }
+  }
+  if constexpr (P > 1) {
+    __syncthreads();
+    for (int t = threadIdx.x; t < G * 16 * RW; t += 64 * G * P) {
+      const int c = t % RW;
+      const int m = (t / RW) % 16;
+      const int gg = t / (RW * 16);
+      const int n = blockIdx.x * (G * RW) + gg * RW + c;
+      if (m < M && n < N) {
+        float s = red[gg][0][m * RW + c];
+#pragma unroll
+        for (int q = 1; q < P; ++q) s += red[gg][q][m * RW + c];
+        if (bias != nullptr) s += bf2f(bias[n]);
+        y[(size_t)m * sy + n] = f2bf(s);
+      }
+    }
+  }
+}
+
+template <int R, int CH, int G, int P, bool HB, int RED, int DIAG>
+static int skf2_launch_t(const void* x, const void* w, const void* b, void* y, int M, int N,
+                         int sx, int sy, int stag, hipStream_t s) {
+  constexpr int ROWS = G * R * 4;
+  hipLaunchKernelGGL((skf2_kernel<R, CH, G, P, HB, RED, DIAG>), dim3((N + ROWS - 1) / ROWS),
+                     dim3(64 * G * P), 0, s, (const uint16_t*)x, (const uint16_t*)w,
+                     (const uint16_t*)b, (uint16_t*)y, M, N, sx, sy, stag);
+  return (int)hipGetLastError();
+}
+
+struct Skf2Entry {
+  int r, p, g, hb, nseg, red, diag;
+  skg_fn fn;
+};
+
+// One config = (R, P, G, HB, NSEG, RED, DIAG); K = 128 * NSEG.
+#define SKF2_C(R, P, G, HB, NSEG, RED, DIAG) \
+  {R, P, G, HB, NSEG, RED, DIAG, &skf2_launch_t<R, (NSEG) / (P), G, P, (HB) != 0, RED, DIAG>},
+
+#ifdef SKG_SWEEP
+#define SKF2_RD(R, P, G, NSEG) SKF2_C(R, P, G, 0, NSEG, 0, 0) SKF2_C(R, P, G, 0, NSEG, 1, 0)
+#define SKF2_DG(R, P, G, NSEG)                                                          \
+  SKF2_C(R, P, G, 0, NSEG, 1, 1) SKF2_C(R, P, G, 0, NSEG, 1, 2) SKF2_C(R, P, G, 0, NSEG, 0, 1) \
+      SKF2_C(R, P, G, 0, NSEG, 0, 2)
+#define SKF2_TABLE                                                                     \
+  /* K = 2048 */                                                                       \
+  SKF2_RD(1, 4, 1, 16) SKF2_RD(2, 4, 1, 16) SKF2_RD(4, 4, 1, 16)                        \
+  SKF2_RD(1, 4, 2, 16) SKF2_RD(2, 4, 2, 16) SKF2_RD(4, 4, 2, 16)                        \
+  SKF2_RD(1, 8, 1, 16) SKF2_RD(2, 8, 1, 16) SKF2_RD(4, 8, 1, 16) SKF2_RD(8, 8, 1, 16)   \
+  SKF2_RD(1, 8, 2, 16) SKF2_RD(2, 8, 2, 16) SKF2_RD(4, 8, 2, 16) SKF2_RD(8, 8, 2, 16)   \
+  SKF2_RD(1, 16, 1, 16) SKF2_RD(2, 16, 1, 16) SKF2_RD(4, 16, 1, 16) SKF2_RD(8, 16, 1, 16) \
+  SKF2_DG(2, 8, 1, 16) SKF2_DG(4, 8, 1, 16) SKF2_DG(8, 8, 1, 16)                        \
+  /* K = 256 */                                                                        \
+  SKF2_RD(1, 1, 1, 2) SKF2_RD(2, 1, 1, 2) SKF2_RD(4, 1, 1, 2) SKF2_RD(8, 1, 1, 2)       \
+  SKF2_RD(1, 2, 1, 2) SKF2_RD(2, 2, 1, 2) SKF2_RD(4, 2, 1, 2) SKF2_RD(8, 2, 1, 2)       \
+  SKF2_RD(1, 1, 2, 2) SKF2_RD(2, 1, 2, 2) SKF2_RD(4, 1, 2, 2) SKF2_RD(8, 1, 2, 2)       \
+  SKF2_RD(1, 2, 2, 2) SKF2_RD(2, 2, 2, 2) SKF2_RD(4, 2, 2, 2) SKF2_RD(8, 2, 2, 2)
+#endif
+
+#ifdef SKF2_TABLE
+static const Skf2Entry kF2Table[] = {SKF2_TABLE};
+static const int kF2TableLen = sizeof(kF2Table) / sizeof(kF2Table[0]);
+#else
+static const Skf2Entry kF2Table[1] = {{0, 0, 0, 0, 0, 0, 0, nullptr}};
+static const int kF2TableLen = 0;
+#endif
+
+extern "C" {
+
+int skf2_count() { return kF2TableLen; }
+
+int skf2_entry(int i, int* out7) {
+  if (i < 0 || i >= kF2TableLen) return -1;
+  const Skf2Entry& e = kF2Table[i];
+  out7[0] = e.r;
+  out7[1] = e.p;
+  out7[2] = e.g;
+  out7[3] = e.hb;
+  out7[4] = e.nseg;
+  out7[5] = e.red;
+  out7[6] = e.diag;
+  return 0;
+}
+
+int skf2_find(int r, int p, int g, int hb, int nseg, int red, int diag) {
+  for (int i = 0; i < kF2TableLen; ++i) {
+    const Skf2Entry& e = kF2Table[i];
+    if (e.r == r && e.p == p && e.g == g && e.hb == hb && e.nseg == nseg && e.red == red &&
+        e.diag == diag)
+      return i;
+  }
+  return -1;
+}
+
+int skf2_launch(int idx, const void* x, const void* w, const void* b, void* y, int M, int N,
+                int sx, int sy, int stag, void* stream) {
+  if (idx < 0 || idx >= kF2TableLen) return -1;
+  return kF2Table[idx].fn(x, w, b, y, M, N, sx, sy, stag, (hipStream_t)stream);
+}
+
+}  // extern "C"
 
 extern "C" {
 

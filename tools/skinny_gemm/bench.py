@@ -276,7 +276,7 @@ def main():
 
 
 if __name__ == "__main__":
-    which = os.environ.get("SKINNY_BENCH", "v3f")
+    which = os.environ.get("SKINNY_BENCH", "v3g")
     if which == "v1":
         sys.exit(main())
     if which == "v2":
@@ -291,6 +291,10 @@ if __name__ == "__main__":
         from v3 import main_q
 
         sys.exit(main_q())
-    from v3 import main_f
+    if which == "v3f":
+        from v3 import main_f
 
-    sys.exit(main_f())
+        sys.exit(main_f())
+    from v3 import main_g
+
+    sys.exit(main_g())

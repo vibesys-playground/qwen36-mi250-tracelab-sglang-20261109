@@ -859,3 +859,299 @@ def main_f():
             f"M16 step {s16:.0f} vs {e16:.0f} ({100 * reg16:+.1f}%); worst per-shape M16 {100 * shape16:+.1f}%; "
             f"invariant {inv[key]}, replay {stress[key]} -> {'PASS' if passed else 'FAIL'}")
     return 0
+
+
+# ============================================ plan 20: 4x4x4 MFMA GEMV with reduce-scatter (f2)
+F0_J124 = {  # j124's best skf ("f") configs: (R, P, G, hoist)
+    (32, 2048): (1, 8, 1, 0), (256, 2048): (1, 8, 1, 0), (512, 2048): (2, 8, 1, 0),
+    (2048, 256): (1, 1, 1, 0), (2048, 2048): (1, 8, 1, 0), (4608, 2048): (2, 8, 1, 1),
+    (6144, 2048): (2, 8, 1, 1),
+}
+QKVZ_N, BA_N = 6144, 32
+MOE = ("moe_router", "shared_gate_up", "shared_down")
+
+
+def layer_order_packed(moe=True):
+    """One decode step with qkvz+ba as one packed call ("in_proj"): 200 calls (80 without MoE)."""
+    seq = []
+    for layer in range(40):
+        if layer % 4 == 3:
+            seq += ["attn_qkv", "attn_o"]
+        else:
+            seq += ["in_proj", "gdn_out"]
+        if moe:
+            seq += list(MOE)
+    return seq
+
+
+def main_g():
+    from sglang.kernels.ops.gemm import skinny_gemm_packed_hip as pk
+
+    torch.manual_seed(0)
+    props = torch.cuda.get_device_properties(0)
+    log("device:", torch.cuda.get_device_name(0), props.gcnArchName, "CUs", props.multi_processor_count)
+    log("torch", torch.__version__, "hip", torch.version.hip, "triton", triton.__version__)
+    t0 = time.time()
+    lib = hg.build(defines=("-DSKG_SWEEP", "-DSKG_NO_SCALAR"))
+    log(f"hip build+load {time.time() - t0:.1f}s: {len(lib.f_entries)} f + {len(lib.f2_entries)} f2 kernels")
+    ws = make_weights()
+    ws["in_proj"] = [torch.cat([a, b_]).contiguous() for a, b_ in zip(ws["gdn_qkvz"], ws["gdn_ba"])]
+    names = ["in_proj"] + [nm for nm, *_ in SHAPES if nm not in ("gdn_qkvz", "gdn_ba")]
+    allnames = names + ["gdn_qkvz", "gdn_ba"]
+    shape_of = {nm: tuple(ws[nm][0].shape) for nm in allnames}
+    count = {nm: c for nm, _, _, c in SHAPES}
+    count["in_proj"] = 30
+    xs = {}
+    for m in MS_ALL:
+        for k in (2048, 256):
+            xs[(m, k)] = torch.randn(m, k, device=DEV).to(torch.bfloat16)
+
+    def head(x, w, name):
+        if name == "in_proj":
+            return pk.skinny_linear_pair(x, w, QKVZ_N)
+        return sk.skinny_linear(x, w, None)
+
+    log("head _GEMV_TUNED:", {k: (v[0], tuple(v[1])) for k, v in sk._GEMV_TUNED.items()})
+
+    def f2op(cfg, idx):
+        return lambda x, w, _n: hg.mfma_gemv(lib, x, w, None, cfg, idx, "f2")
+
+    def fop(cfg, idx):
+        return lambda x, w, _n: hg.mfma_gemv(lib, x, w, None, cfg, idx, "f")
+
+    t_head = {nm: {m: per_shape(head, ws, xs, nm, m) for m in MS_SHAPE} for nm in allnames}
+
+    # ---------------- f0 = j124's skf configs
+    f0 = {}
+    for nm in allnames:
+        n, k = shape_of[nm]
+        c = F0_J124.get((n, k), F0_J124[(6144, 2048)])
+        cfg = hg.MfmaConfig(*c, 0)
+        f0[nm] = (cfg, lib.q_find(cfg, k, "f"))
+    t_f0 = {nm: {m: per_shape(fop(*f0[nm]), ws, xs, nm, m) for m in MS_SHAPE} for nm in allnames}
+
+    # ---------------- f2 sweep per shape (M=2, M=16)
+    t0 = time.time()
+    sweep = {}
+    for nm in allnames:
+        n, k = shape_of[nm]
+        rows = []
+        for cfg in lib.f2_configs(k):
+            idx = lib.q_find(cfg, k, "f2")
+            op = f2op(cfg, idx)
+            try:
+                rows.append((per_shape(op, ws, xs, nm, 2), per_shape(op, ws, xs, nm, 16), cfg, idx))
+            except Exception as ex:  # noqa: BLE001
+                log("f2 cfg fail", nm, cfg, repr(ex)[:200])
+        sweep[nm] = rows
+    log(f"f2 sweep took {time.time() - t0:.0f}s")
+
+    classes = {
+        "f0r": lambda c: c.red == 0 and c.rows <= 2,  # skf's reduce, re-implemented
+        "fA": lambda c: c.red == 1 and c.rows <= 2,
+        "fB": lambda c: c.red == 0 and c.rows >= 4,
+        "fAB": lambda c: c.red == 1 and c.rows >= 4,
+    }
+    pick = {}  # (class, name) -> (t2, t16, cfg, idx, within_limit)
+    for nm in allnames:
+        lim = 1.05 * t_head[nm][16]
+        log(f"[sweep f2] {nm} {shape_of[nm]}: head M2={t_head[nm][2]:.2f} M16={t_head[nm][16]:.2f} "
+            f"(limit {lim:.2f}); f0 M2={t_f0[nm][2]:.2f} M16={t_f0[nm][16]:.2f}")
+        for cl, pred in list(classes.items()) + [("any", lambda c: True)]:
+            rows = [r for r in sweep[nm] if pred(r[2])]
+            if not rows:
+                continue
+            ok = sorted([r for r in rows if r[1] <= lim], key=lambda r: r[0])
+            best = ok[0] if ok else min(rows, key=lambda r: r[0] + 0.25 * r[1])
+            pick[(cl, nm)] = (*best, bool(ok))
+            fast16 = min(rows, key=lambda r: r[1])
+            log(f"   {cl:4s} pick M2={best[0]:.2f} M16={best[1]:.2f} {tuple(best[2])} within={bool(ok)}; "
+                f"fastest M16 {fast16[1]:.2f} {tuple(fast16[2])}")
+
+    # ---------------- diagnostics at M=2 / M=16 (timing only)
+    log("\n## diagnostics (P=8, G=1): us at M=2 / M=16; base, no cross-lane exchange, one x load")
+    for nm in ("in_proj", "gdn_out", "attn_qkv"):
+        k = shape_of[nm][1]
+        for red in (0, 1):
+            for r_ in (2, 4, 8):
+                cells = []
+                for dg in (0, 1, 2):
+                    cfg = hg.F2Config(r_, 8, 1, 0, red, dg)
+                    idx = lib.q_find(cfg, k, "f2")
+                    if idx < 0:
+                        cells.append("n/a")
+                        continue
+                    op = f2op(cfg, idx)
+                    cells.append(f"{per_shape(op, ws, xs, nm, 2):.2f}/{per_shape(op, ws, xs, nm, 16):.2f}")
+                log(f"   {nm} red={red} R={r_}: base {cells[0]}  noexch {cells[1]}  onex {cells[2]}")
+
+    # ---------------- mix: per shape the fastest at M=2 of head and f2 with M16 <= 1.05 head
+    choice = {}
+    for nm in allnames:
+        r = pick.get(("any", nm))
+        use = r is not None and r[4] and r[0] < t_head[nm][2]
+        choice[nm] = (r[2], r[3]) if use else None
+    # qkvz and ba alone must give the packed bits: same config as in_proj (rows depend on K, P only)
+    if choice["in_proj"] is not None:
+        cfg = choice["in_proj"][0]
+        for nm in ("gdn_qkvz", "gdn_ba"):
+            choice[nm] = (cfg, lib.q_find(cfg, shape_of[nm][1], "f2"))
+    else:
+        choice["gdn_qkvz"] = choice["gdn_ba"] = None
+    log("mix choice:", {nm: (tuple(c[0]) if c else "head") for nm, c in choice.items()})
+
+    def mix(x, w, name):
+        c = choice.get(name)
+        if c is None:
+            return head(x, w, name)
+        return hg.mfma_gemv(lib, x, w, None, c[0], c[1], "f2")
+
+    def cls_op(cl):
+        def op(x, w, name):
+            r = pick.get((cl, name))
+            if r is None:
+                return head(x, w, name)
+            return hg.mfma_gemv(lib, x, w, None, r[2], r[3], "f2")
+        return op
+
+    ops = {"head": head, "f0": lambda x, w, nm: hg.mfma_gemv(lib, x, w, None, f0[nm][0], f0[nm][1], "f"),
+           "fA": cls_op("fA"), "fB": cls_op("fB"), "fAB": cls_op("fAB"), "mix": mix}
+    keys = list(ops)
+    res = {key: {(nm, m): per_shape(ops[key], ws, xs, nm, m) for nm in allnames for m in MS_SHAPE} for key in keys}
+    r_us = {nm: read_us(lib, ws[nm]) for nm in allnames}
+
+    # ---------------- correctness of the mix (and every f2 config it uses)
+    bad = []
+    for nm in allnames:
+        k = shape_of[nm][1]
+        v = invariant(mix, ws, xs, nm, k, reps=100)
+        if v != "ok":
+            bad.append(f"{nm}: {v}")
+    inv_ok = not bad
+    log(f"[check] mix: bitwise batch-invariant (M=1..16, contiguous and view) and 100 repeats: {inv_ok} {bad}")
+    errs = {nm: {m: (max_err(mix, ws, xs, nm, shape_of[nm][1], m), max_err(head, ws, xs, nm, shape_of[nm][1], m))
+                 for m in (1, 2, 16)} for nm in allnames}
+    err_ok = all(a <= 1.5 * b + 1e-3 for d in errs.values() for a, b in d.values())
+    log(f"[check] mix max err vs fp32 within 1.5x head's: {err_ok}")
+    for nm, d in errs.items():
+        log(f"   {nm}: " + ", ".join(f"M{m} {a:.4g}/{b:.4g}" for m, (a, b) in d.items()))
+    packed_eq = True
+    if choice["in_proj"] is not None:
+        for m in MS_ALL:
+            x = xs[(m, 2048)]
+            yp = mix(x, ws["in_proj"][0], "in_proj")
+            if not (torch.equal(yp[:, :QKVZ_N], mix(x, ws["gdn_qkvz"][0], "gdn_qkvz"))
+                    and torch.equal(yp[:, QKVZ_N:], mix(x, ws["gdn_ba"][0], "gdn_ba"))):
+                packed_eq = False
+                log(f"[check] packed != unpacked at M={m}")
+    log(f"[check] packed in_proj == qkvz and ba alone, bitwise, M=1..16: {packed_eq}")
+    bias_ok = True
+    for nm in allnames:
+        c = choice.get(nm)
+        if c is None:
+            continue
+        n, k = shape_of[nm]
+        w = ws[nm][0]
+        b = (torch.randn(n, device=DEV) * 0.1).to(torch.bfloat16)
+        for m in (1, 3, 16):
+            x = xs[(m, k)]
+            ref = x.float() @ w.float().t() + b.float()
+            eq = (hg.mfma_gemv(lib, x, w, b, c[0], c[1], "f2").float() - ref).abs().max().item()
+            ee = (x.float() @ w.float().t()).to(torch.bfloat16).float().add(b.float()).sub(ref).abs().max().item()
+            if eq > 1.5 * ee + 2e-2:
+                bias_ok = False
+                log(f"[check] bias {nm} M={m}: {eq:.4g} (ref rounding {ee:.4g})")
+    log(f"[check] f2 bias path: {bias_ok}")
+    stress_ok = True
+    for nm in allnames:
+        k = shape_of[nm][1]
+        wl = ws[nm]
+        for m in (2, 16):
+            xin = torch.randn(m, k, device=DEV).to(torch.bfloat16)
+            outs = []
+
+            def fn():
+                outs.clear()
+                for w in wl:
+                    outs.append(mix(xin, w, nm))
+
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                fn()
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                fn()
+            for it in range(10):
+                xin.copy_(torch.randn(m, k, device=DEV))
+                g.replay()
+                torch.cuda.synchronize()
+                for i in (0, len(wl) - 1):
+                    if not torch.equal(outs[i], mix(xin, wl[i], nm)):
+                        stress_ok = False
+            del g
+    log(f"[check] mix graph replay with fresh inputs == eager: {stress_ok}")
+
+    # ---------------- step graphs (packed in_proj = one call)
+    def step_seq(op, m, seq):
+        idx = {nm: 0 for nm in names}
+        calls = []
+        for nm in seq:
+            calls.append((nm, ws[nm][idx[nm]]))
+            idx[nm] += 1
+
+        def fn():
+            for nm, w in calls:
+                op(xs[(m, w.shape[1])], w, nm)
+
+        return graph_time(fn, iters=10)
+
+    seq_all, seq_nomoe = layer_order_packed(True), layer_order_packed(False)
+    stp = {key: {m: step_seq(ops[key], m, seq_all) for m in MS_ALL} for key in ("head", "f0", "fAB", "mix")}
+    stp_nm = {key: {m: step_seq(ops[key], m, seq_nomoe) for m in (1, 2, 4, 8, 16)} for key in ("head", "mix")}
+    for key in ("head", "mix"):
+        log(f"[{key}] step M=2 repeats: {[round(step_seq(ops[key], 2, seq_all)) for _ in range(2)]}")
+
+    # ---------------- tables
+    log("\n## per-shape us/call (graph replay, own weight per call); in_proj = packed qkvz+ba [6176, 2048]")
+    for m in MS_SHAPE:
+        log(f"\nM={m}")
+        log(" | ".join(["shape", "N", "K", "calls"] + keys + ["r"] + [f"{k} GB/s" for k in ("head", "mix")]))
+        for nm in allnames:
+            n, k = shape_of[nm]
+            us = [res[key][(nm, m)] for key in keys] + [r_us[nm]]
+            gb = [wbytes(n, k, m) / res[key][(nm, m)] / 1e3 for key in ("head", "mix")]
+            log(" | ".join([nm, str(n), str(k), str(count.get(nm, 0))] + [f"{u:.2f}" for u in us] + [f"{g:.0f}" for g in gb]))
+        log(" | ".join(["sum(count*us), packed in_proj", "", "", "200"] + [
+            f"{sum(res[key][(nm, m)] * count[nm] for nm in names):.0f}" for key in keys]
+            + [f"{sum(r_us[nm] * count[nm] for nm in names):.0f}"]))
+    log("\n## 200-call step graph us by M (packed in_proj as one call)")
+    log(" | ".join(["M", "head", "f0", "fAB", "mix"]))
+    for m in MS_ALL:
+        log(" | ".join([str(m)] + [f"{stp[k][m]:.0f}" for k in ("head", "f0", "fAB", "mix")]))
+    log("\n## non-MoE step graph (80 calls: in_proj, gdn_out, attn_qkv, attn_o) us by M")
+    log(" | ".join(["M", "head", "mix"]))
+    for m in (1, 2, 4, 8, 16):
+        log(" | ".join([str(m)] + [f"{stp_nm[k][m]:.0f}" for k in ("head", "mix")]))
+    log("\nMIX_TUNED (f2: R, P, G, hoist, red) = {")
+    for nm in allnames:
+        c = choice[nm]
+        log(f"    {shape_of[nm]}: {tuple(c[0])[:5] if c else None},  # {nm}")
+    log("}")
+
+    # ---------------- gate
+    h2, h16 = stp["head"][2], stp["head"][16]
+    m2, m16 = stp["mix"][2], stp["mix"][16]
+    nm_save = stp_nm["head"][2] - stp_nm["mix"][2]
+    worst = max((res["mix"][(nm, 16)] / res["head"][(nm, 16)] - 1, nm) for nm in names if choice[nm] is not None) \
+        if any(choice[nm] for nm in names) else (0.0, "-")
+    passed = (inv_ok and stress_ok and err_ok and packed_eq and (h2 - m2) >= 500
+              and worst[0] <= 0.05 and m16 / h16 - 1 <= 0.05)
+    log(f"\nGATE: step M2 {m2:.0f} vs head {h2:.0f} us, saving {(h2 - m2) / 1000:.3f} ms (>= 0.5); "
+        f"non-MoE saving {nm_save / 1000:.3f} ms (>= 0.4 after plan 13); M16 step {m16:.0f} vs {h16:.0f} "
+        f"({100 * (m16 / h16 - 1):+.1f}%); worst chosen shape M16 {100 * worst[0]:+.1f}% ({worst[1]}); "
+        f"invariant {inv_ok}, replay {stress_ok}, err {err_ok}, packed bitwise {packed_eq} -> "
+        f"{'PASS' if passed else 'FAIL'}")
+    return 0

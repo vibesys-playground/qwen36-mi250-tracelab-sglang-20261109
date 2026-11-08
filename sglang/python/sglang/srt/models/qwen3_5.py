@@ -273,7 +273,7 @@ def _qwen3_5_stage_facts(
 
 # gfx90a: the fused QK norm + mrope + gate prologue (EXPLICIT_ROPE_FMA and PDL stay off on HIP).
 _hip_fused_qk_rope_gate = (
-    _is_hip_gfx90a and envs.SGLANG_HIP_FUSED_QK_ROPE_GATE.get()
+    _is_hip_gfx90a and not _use_aiter and envs.SGLANG_HIP_FUSED_QK_ROPE_GATE.get()
 )
 if _is_cuda or _hip_fused_qk_rope_gate:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
