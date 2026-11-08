@@ -51,6 +51,7 @@ sources = [
     # Native HIP implementation of the same three ops exposed by topk.cu.
     "csrc/elementwise/topk.hip",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
+    "csrc/moe/hip_decode_moe_block.hip",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
