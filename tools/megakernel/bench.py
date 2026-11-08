@@ -242,6 +242,26 @@ def head_ops():
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
     from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
     from sglang.srt.layers.activation import SiluAndMul
+    import contextlib
+    import types
+    import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as fm
+
+    # Single process, no TP group: the output allocation is not symmetric (as at TP=2 with
+    # symmetric memory off), and the fused moe_sum+all-reduce stays off (its default).
+    fm.get_parallel = lambda: types.SimpleNamespace(tp_group=None)
+    fm.use_symmetric_memory = lambda *a, **k: contextlib.nullcontext()
+    fm.is_allocation_symmetric = lambda: False
+    real_get_exec = fm.get_exec
+
+    def get_exec():
+        try:
+            e = real_get_exec()
+            e.moe.enable_fused_moe_sum_all_reduce  # noqa: B018
+            return e
+        except Exception:  # noqa: BLE001
+            return types.SimpleNamespace(moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False))
+
+    fm.get_exec = get_exec
     act = SiluAndMul()
     silu_mul = act
     cfg = MoeRunnerConfig(inplace=False)
