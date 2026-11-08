@@ -588,7 +588,8 @@ def calarge_one(rank, g_ranks, pg, ca, nccl, car, label, nbytes, expect, mode, c
             assert out is not None
             return out
         assert ca.custom_all_reduce(hv) is None  # CA declines; the caller falls back to RCCL
-        return nccl.outplace_all_reduce(hv)
+        with nccl.change_state(enable=True):  # pynccl is disabled outside the enabled state
+            return nccl.outplace_all_reduce(hv)
 
     A = _large_A(rank, 0, rows, mode)
     # warm hipBLASLt workspace (eager and on the capture stream) before any capture
@@ -725,7 +726,10 @@ def calarge_worker(rank, world):
     print(f"CAINIT rank{rank} group={g_ranks} disabled={ca.disabled} max_size={ca.max_size} "
           f"full_nvlink={ca.full_nvlink} deterministic={ca.use_amd_deterministic_impl}",
           flush=True)
+    only = os.environ.get("CALARGE_ONLY")
     for label, nbytes, expect in LARGE_SIZES:
+        if only and label != only:
+            continue
         for mode in ("eager", "graph"):
             dist.barrier()
             try:
