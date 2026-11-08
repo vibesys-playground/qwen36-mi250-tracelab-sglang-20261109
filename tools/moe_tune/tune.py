@@ -61,6 +61,76 @@ def _patch_runtime():
     return fm, fc
 
 
+DRY = os.environ.get("MOE_TUNE_DRY") == "1"
+DEV = "cpu" if DRY else "cuda"
+_ALLOWED_OPTS = {"num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim", "kpack",
+                 "launch_pdl", "num_ctas", "maxnreg"}
+_dry_seen = set()
+
+
+def _install_dry_patches(fm):
+    """CPU-only run: checks imports, argument construction and every kernel argument/constexpr
+    type (the things that failed j11/j16). The device launch and sgl_kernel ops are replaced."""
+    import types
+    import sglang.kernels.ops.moe.fused_moe_triton_kernels as ftk
+    import torch.nn.functional as F
+
+    props = types.SimpleNamespace(gcnArchName="gfx90a:sramecc+:xnack-", multi_processor_count=104, name="AMD Instinct MI210")
+    torch.cuda.is_available = lambda: True
+    torch.cuda.current_device = lambda: 0
+    torch.cuda.get_device_properties = lambda i=0: props
+    torch.cuda.synchronize = lambda *a, **k: None
+
+    class Ev:
+        def __init__(self, **k): pass
+        def record(self): self.t = time.perf_counter()
+        def elapsed_time(self, o): return (o.t - self.t) * 1000.0
+    torch.cuda.Event = Ev
+
+    real = ftk.fused_moe_kernel
+    import triton.language as tl
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kw):
+                names = list(real.arg_names)
+                bound = dict(zip(names, args))
+                for k, v in kw.items():
+                    if k in bound:
+                        raise TypeError(f"duplicate argument {k}")
+                    if k not in names and k not in _ALLOWED_OPTS:
+                        raise TypeError(f"unknown kernel kwarg {k}")
+                    bound[k] = v
+                for i, n in enumerate(names):
+                    if n not in bound and not real.params[i].has_default:
+                        raise TypeError(f"missing kernel argument {n}")
+                for i, n in enumerate(names):
+                    if n in bound and real.params[i].is_constexpr:
+                        v = bound[n]
+                        if not (v is None or isinstance(v, (bool, int, float, str, tl.dtype))):
+                            raise TypeError(f"constexpr {n} has type {type(v).__name__}: {v!r}")
+                    elif n in bound:
+                        v = bound[n]
+                        if not (v is None or isinstance(v, (bool, int, float, torch.Tensor))):
+                            raise TypeError(f"argument {n} has type {type(v).__name__}")
+                if callable(grid):
+                    grid(bound)
+                _dry_seen.add(tuple(sorted(k for k in kw)))
+            return launch
+    ftk.fused_moe_kernel = FakeKernel()
+    ftk.is_arch_support_pdl = lambda: False
+    fm.moe_sum_reduce_triton = lambda *a, **k: None
+    fm.silu_and_mul = lambda x, out: out.copy_(F.silu(x[:, : x.shape[1] // 2]) * x[:, x.shape[1] // 2:])
+
+    def align(topk_ids, bs, E, *a, **k):
+        n = topk_ids.numel() + E * (bs - 1)
+        n = (n + bs - 1) // bs * bs
+        return (torch.zeros(n, dtype=torch.int32), torch.zeros(n // bs, dtype=torch.int32),
+                torch.tensor([n], dtype=torch.int32))
+    fm.moe_align_block_size = align
+    fm.outplace_fused_experts = lambda *a, **k: fm.fused_experts_impl(*a[:7], False, *a[7:], **k)  # the custom-op wrapper only has a CUDA kernel
+
+
 def bench(fn, iters=20, reps=3):
     fn()  # compile / surface errors eagerly
     torch.cuda.synchronize()
@@ -137,6 +207,9 @@ def main():
     a = ap.parse_args()
 
     fm, fc = _patch_runtime()
+    if DRY:
+        _install_dry_patches(fm)
+        fc._is_hip = True
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.utils import get_device_name
 
@@ -145,7 +218,7 @@ def main():
           "CUs", props.multi_processor_count, "triton", triton.__version__, "torch", torch.__version__, flush=True)
     print("CONFIGFILE", fc.get_config_file_name(a.E, a.moe_inter // 8, None, [0, 0], False, False), flush=True)
     torch.manual_seed(0)
-    dev = "cuda"
+    dev = DEV
     real_try = fc.try_get_optimal_moe_config
     cur = {}
 
@@ -157,6 +230,8 @@ def main():
     rcfg = MoeRunnerConfig(inplace=False)
 
     summary = []
+    _errs = {}
+    stage_hint = ["up"]
     for tp in [int(x) for x in a.tps.split(",")]:
         N = a.moe_inter // tp
         K = a.hidden
@@ -179,6 +254,10 @@ def main():
                     return bench(run)
                 except Exception as e:
                     torch.cuda.synchronize()
+                    msg = type(e).__name__ + ": " + str(e).splitlines()[0][:160] if str(e) else type(e).__name__
+                    _errs[msg] = _errs.get(msg, 0) + 1
+                    if _errs[msg] == 1 and len(_errs) <= 12:
+                        print("CANDIDATE-ERROR", msg, "cfg", cur.get("up") if stage_hint[0] == "up" else cur.get("down"), flush=True)
                     return float("inf")
                 finally:
                     cur.clear()
@@ -200,6 +279,7 @@ def main():
                 down = dict(base)
                 # up search (down fixed)
                 for stage, (out_dim, kdim) in (("up", (2 * N, K)), ("down", (K, N))):
+                    stage_hint[0] = stage
                     pool = cands(BM, out_dim, kdim, M)
                     res = []
                     for c in pool:
@@ -250,6 +330,7 @@ def main():
             if a.outdir:
                 os.makedirs(a.outdir, exist_ok=True)
                 open(os.path.join(a.outdir, name), "w").write(txt)
+    print("ERROR-COUNTS", json.dumps(_errs))
     print("SUMMARY")
     for r in summary:
         print(f"TP{r['tp']} M={r['M']:5d} default {r['default_us']:9.1f}us tuned {r['tuned_us']:9.1f}us x{r['speedup']:.2f} relerr {r['rel_err']}")
