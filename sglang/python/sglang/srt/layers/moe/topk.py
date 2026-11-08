@@ -193,6 +193,22 @@ def _use_rocm_triton_softmax_topk(
     )
 
 
+# HIP without aiter: for decode-sized batches (M * topk <= 64) route softmax
+# top-k through the single-launch Triton router instead of the AOT
+# topk_softmax kernel, whose launch costs ~3x more on gfx90a. Same math (fp32
+# softmax, lowest expert id wins ties, renormalize over the selected experts);
+# each row is routed by its own program, so the result is batch invariant.
+_use_hip_small_m_triton_router = _is_hip and not _use_aiter
+_HIP_SMALL_M_ROUTER_MAX_NUMEL = 64
+
+
+def _use_hip_small_m_softmax_topk(gating_output: torch.Tensor, topk: int) -> bool:
+    return (
+        _use_hip_small_m_triton_router
+        and gating_output.shape[0] * topk <= _HIP_SMALL_M_ROUTER_MAX_NUMEL
+    )
+
+
 _use_aiter_topk_gating = not envs.SGLANG_ROCM_DISABLE_AITER_TOPK_GATING.get()
 
 # Above this, topk_gating is slower than fused_topk on GPU time.
@@ -1372,7 +1388,11 @@ def fused_topk(
                 packed_out=packed_out,
             )
         # ===== END TO BE REFACTORED ====
-        elif _is_cuda or use_rocm_triton:
+        elif (
+            _is_cuda
+            or use_rocm_triton
+            or _use_hip_small_m_softmax_topk(gating_output, topk)
+        ):
             # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,

@@ -18,7 +18,11 @@ _is_musa = is_musa()
 if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sglang.kernels.ops.moe import moe_align_block_size as sgl_moe_align_block_size
 
-if _is_cuda:
+# The single-launch tiny-batch align is plain Triton: on HIP (no PDL) it
+# replaces the align + count_and_sort pair the same way it does on CUDA.
+_use_small_numel_align = _is_cuda or _is_hip
+
+if _use_small_numel_align:
     from sglang.kernels.ops.moe.moe_align_small_numel import (
         SMALL_NUMEL_LIMIT,
         moe_align_small_numel,
@@ -144,7 +148,7 @@ def moe_align_block_size(
     # O(numel ** 2) pairwise, so leave that side to it. ignore_invalid_expert is
     # a different contract from the "+1 offset" convention this kernel implements.
     if (
-        _is_cuda
+        _use_small_numel_align
         and topk_ids.numel() <= SMALL_NUMEL_LIMIT
         and num_experts + 1 > _CUDA_SMALL_BATCH_MAX_BUCKETS
         and not ignore_invalid_expert
