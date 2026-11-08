@@ -44,8 +44,18 @@ class _Z:
 def _patch_runtime():
     import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as fm
     import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config as fc
-    fm.get_exec = lambda: _Z()
-    fc.get_exec = lambda: _Z()
+    class _Det:
+        enable_deterministic_inference = False
+
+    class _Moe:
+        enable_fused_moe_sum_all_reduce = False
+
+    class _Exec:
+        deterministic = _Det()
+        moe = _Moe()
+
+    fm.get_exec = lambda: _Exec()
+    fc.get_exec = lambda: _Exec()
     fm.get_parallel = lambda: _Z()
     fm.is_allocation_symmetric = lambda: False
     return fm, fc
