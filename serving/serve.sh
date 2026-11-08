@@ -25,6 +25,9 @@ fi
 #   Both ranks sum in rank order 0,1 in fp32, so they get bitwise identical results.
 # - The chat default is non-thinking (per-request chat_template_kwargs still override it).
 # - Usage reports cached prompt tokens, which the replay's prefix-cache accounting reads.
+# - Prefill runs eager by default off CUDA, so it is bound by CPU launch time (about 108 ms
+#   per step at <=1k new tokens). Breakable prefill graphs replay the segments between the
+#   attention and GDN calls, which stay eager; buckets above 1024 tokens are GPU-bound.
 # Parallel layout: four TP=2 replicas, one per MI250 card. DP rank r takes HIP devices 2r and
 # 2r+1, which are the two GCDs of one package (measured, plan 4 step 1), so every all-reduce
 # stays on the in-package link. prefix_affinity sends each session's later rounds to the
@@ -35,5 +38,7 @@ exec python3 -m sglang.launch_server "$@" \
   --dp-size 4 \
   --load-balance-method prefix_affinity \
   --attention-backend triton \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-prefill 1024 \
   --enable-cache-report \
   --default-chat-template-kwargs '{"enable_thinking": false}'
