@@ -10,6 +10,28 @@ import argparse, itertools, json, math, os, sys, time, traceback
 import torch
 import triton
 
+try:  # the tuner never calls aiter; importing sglang's quantization package may touch it on HIP
+    import aiter  # noqa: F401
+except ImportError:
+    import importlib.abc, importlib.machinery, types
+    from unittest import mock
+
+    class _AiterFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+        def find_spec(self, name, path, target=None):
+            if name == "aiter" or name.startswith("aiter."):
+                return importlib.machinery.ModuleSpec(name, self, is_package=True)
+
+        def create_module(self, spec):
+            m = mock.MagicMock(name=spec.name)
+            m.__path__ = []
+            m.__spec__ = spec
+            return m
+
+        def exec_module(self, module):
+            pass
+
+    sys.meta_path.insert(0, _AiterFinder())
+
 
 class _Z:
     def __getattr__(self, n):
@@ -106,7 +128,6 @@ def main():
 
     fm, fc = _patch_runtime()
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.utils import get_device_name
 
     props = torch.cuda.get_device_properties(0)
@@ -137,7 +158,7 @@ def main():
             x = torch.randn(M, K, device=dev).to(torch.bfloat16)
             ids = torch.rand(M, E, device=dev).topk(a.topk, dim=1).indices.to(torch.int32)
             wts = torch.softmax(torch.randn(M, a.topk, device=dev), dim=1).float()
-            tko = StandardTopKOutput(wts, ids, torch.zeros(M, E, device=dev))
+            tko = (wts, ids, None)
 
             def run():
                 return fm.fused_experts(x, w1, w2, tko, rcfg)
