@@ -20,6 +20,7 @@ import signal
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -108,6 +109,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -154,6 +156,99 @@ class DPBudget:
         return target_rank
 
 
+class PrefixAffinityRouter:
+    """Session-affine routing for DP replicas that each own a prefix cache.
+
+    A request is split into fixed blocks of token ids; each block is keyed by a
+    hash chained over all blocks before it, so a key names one exact prefix.
+    Every dispatch records its blocks under the chosen rank. A later request
+    whose prompt extends a recorded prefix (the next round of a session: the
+    previous prompt, its output and the new input) goes to the rank that holds
+    the deepest matching block, where the radix cache (and, for hybrid models,
+    the recurrent-state cache) can reuse it. A request with no such match (a
+    new session) goes to the least-loaded rank. A block held by several ranks
+    (a prefix common to many sessions) does not pin a request to one rank; the
+    request goes to the least-loaded rank among those holding it.
+
+    Routing only picks the replica. It never changes what a replica computes,
+    so outputs and cached-token accounting stay those of the chosen replica.
+    """
+
+    def __init__(
+        self,
+        num_ranks: int,
+        block_size: int = 256,
+        max_blocks: int = 1 << 16,
+        min_match_fraction: float = 0.25,
+        session_window_s: float = 10.0,
+    ):
+        self.num_ranks = num_ranks
+        self.block_size = block_size
+        self.max_blocks = max_blocks
+        self.min_match_fraction = min_match_fraction
+        self.session_window_s = session_window_s
+        # chained block hash -> bitmask of ranks that hold that prefix.
+        self.blocks: "OrderedDict[int, int]" = OrderedDict()
+        # session key (hash of the first block) -> (rank, last dispatch time).
+        self.sessions: "OrderedDict[int, tuple[int, float]]" = OrderedDict()
+
+    def _block_hashes(self, input_ids) -> list[int]:
+        bs = self.block_size
+        hashes = []
+        h = 0
+        for start in range(0, len(input_ids) - bs + 1, bs):
+            h = hash((h, tuple(input_ids[start : start + bs])))
+            hashes.append(h)
+        return hashes
+
+    def _recent_sessions(self, now: float) -> list[int]:
+        counts = [0] * self.num_ranks
+        stale = []
+        for key, (rank, t) in self.sessions.items():
+            if now - t > self.session_window_s:
+                stale.append(key)
+            elif rank < self.num_ranks:
+                counts[rank] += 1
+        for key in stale:
+            del self.sessions[key]
+        return counts
+
+    def choose(self, input_ids, active: list[int], inflight: list[int]) -> int:
+        now = time.monotonic()
+        hashes = self._block_hashes(input_ids) if input_ids is not None else []
+        recent = self._recent_sessions(now)
+
+        def least_loaded(candidates):
+            return min(candidates, key=lambda r: (inflight[r], recent[r], r))
+
+        target = None
+        depth = 0
+        holders = 0
+        for i, h in enumerate(hashes):
+            mask = self.blocks.get(h)
+            if not mask:
+                break
+            depth, holders = i + 1, mask
+        if depth and depth * self.block_size >= self.min_match_fraction * len(
+            input_ids
+        ):
+            candidates = [r for r in active if holders >> r & 1]
+            if candidates:
+                target = least_loaded(candidates)
+        if target is None:
+            target = least_loaded(active)
+
+        for h in hashes:
+            self.blocks[h] = self.blocks.get(h, 0) | (1 << target)
+            self.blocks.move_to_end(h)
+        while len(self.blocks) > self.max_blocks:
+            self.blocks.popitem(last=False)
+        if hashes:
+            self.sessions[hashes[0]] = (target, now)
+            self.sessions.move_to_end(hashes[0])
+        return target
+
+
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
@@ -190,12 +285,15 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AFFINITY,
         )
+        self.prefix_router = PrefixAffinityRouter(get_parallel().num_dp_ranks)
 
         parallel = get_parallel()
         self.launch_dp_size: int = parallel.num_dp_ranks
@@ -906,6 +1004,20 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def prefix_affinity_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        active = self._active_workers
+        if not active:
+            raise RuntimeError("No active DP workers are available for routing.")
+        target = self.prefix_router.choose(
+            req.input_ids, active, self.dp_budget.total_requests
+        )
+        # The same speculative +1 as DPBudget.dispatch, until the next refresh.
+        self.dp_budget.total_requests[target] += 1
+        logger.debug(f"Prefix affinity: choose worker {target}")
+        sock_send(self.workers[target], req)
 
     def event_loop(self):
         while True:

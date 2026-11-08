@@ -23,8 +23,15 @@ fi
 #   apart, so every collective goes through RCCL.
 # - The chat default is non-thinking (per-request chat_template_kwargs still override it).
 # - Usage reports cached prompt tokens, which the replay's prefix-cache accounting reads.
+# Parallel layout: four TP=2 replicas, one per MI250 card. DP rank r takes HIP devices 2r and
+# 2r+1, which are the two GCDs of one package (measured, plan 4 step 1), so every all-reduce
+# stays on the in-package link. prefix_affinity sends each session's later rounds to the
+# replica whose radix and recurrent-state cache holds its prefix; new sessions go to the
+# least-loaded replica.
 exec python3 -m sglang.launch_server "$@" \
-  --tp-size 8 \
+  --tp-size 2 \
+  --dp-size 4 \
+  --load-balance-method prefix_affinity \
   --attention-backend triton \
   --disable-custom-all-reduce \
   --enable-cache-report \
