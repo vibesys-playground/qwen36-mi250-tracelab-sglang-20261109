@@ -3,17 +3,31 @@ import triton
 import triton.language as tl
 
 
+_INT_TUPLE_ARGS = [
+    "sizes",
+    "cols",
+    "source_row_strides",
+    "source_col_strides",
+    "dest_row_strides",
+    "dest_col_strides",
+]
+
+
+# Strides travel as flat tuples: Triton 3.5 fails to compile nested int tuples in
+# which more than one element holds a value of 1 (the contiguous case).
 @triton.jit(
-    do_not_specialize=["sizes", "cols", "source_strides", "dest_strides"],
-    do_not_specialize_on_alignment=["sizes", "cols", "source_strides", "dest_strides"],
+    do_not_specialize=_INT_TUPLE_ARGS,
+    do_not_specialize_on_alignment=_INT_TUPLE_ARGS,
 )
 def _small_copy_kernel(
     sources,
     destinations,
     sizes,
     cols,
-    source_strides,
-    dest_strides,
+    source_row_strides,
+    source_col_strides,
+    dest_row_strides,
+    dest_col_strides,
     BIT_WIDTHS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -22,12 +36,12 @@ def _small_copy_kernel(
     for i in tl.static_range(len(BIT_WIDTHS)):
         if field == i:
             src_offset = (
-                offsets // cols[i] * source_strides[i][0]
-                + offsets % cols[i] * source_strides[i][1]
+                offsets // cols[i] * source_row_strides[i]
+                + offsets % cols[i] * source_col_strides[i]
             )
             dst_offset = (
-                offsets // cols[i] * dest_strides[i][0]
-                + offsets % cols[i] * dest_strides[i][1]
+                offsets // cols[i] * dest_row_strides[i]
+                + offsets % cols[i] * dest_col_strides[i]
             )
             src = sources[i]
             dst = destinations[i]
@@ -128,8 +142,10 @@ def try_small_copy(dsts, srcs):
             tuple(dsts),
             tuple(sizes),
             tuple(cols),
-            tuple(src_strides),
-            tuple(dst_strides),
+            tuple(stride[0] for stride in src_strides),
+            tuple(stride[1] for stride in src_strides),
+            tuple(stride[0] for stride in dst_strides),
+            tuple(stride[1] for stride in dst_strides),
             tuple(bit_widths),
             BLOCK=256,
         )
