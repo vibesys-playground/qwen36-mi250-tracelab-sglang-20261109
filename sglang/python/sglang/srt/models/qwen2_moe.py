@@ -900,7 +900,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if (
             not defer_finalize
-            and 1 <= num_tokens <= hip_decode_moe_block.MAX_M
+            and 1 <= num_tokens <= hip_decode_moe_block.DISPATCH_MAX_M
             and forward_batch is not None
             and forward_batch.forward_mode.is_decode()
         ):

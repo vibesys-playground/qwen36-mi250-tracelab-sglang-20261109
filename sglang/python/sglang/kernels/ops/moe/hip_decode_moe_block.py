@@ -23,6 +23,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 HIDDEN, NUM_EXPERTS, INTER, TOPK, MAX_M = 2048, 256, 256, 8, 8
+# Largest M the model dispatches here; the op takes up to MAX_M (tools/megakernel/moe_block_bench.py).
+DISPATCH_MAX_M = 8
 _WS_BYTES = 65536
 _workspaces: dict[int, torch.Tensor] = {}
 _grids: dict[int, int] = {}

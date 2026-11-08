@@ -150,31 +150,33 @@ struct Args {
 };
 
 template <int M>
-DEVI void load_x(const uint16_t* x, int lane, uint4 (&xr)[M][4]) {
+DEVI void gemv_dots(const uint4 (&w)[2][4], const uint16_t* x, int lane, float (&o)[2][M]) {
 #pragma unroll
-  for (int m = 0; m < M; ++m)
+  for (int m = 0; m < M; ++m) {
+    uint4 xm[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) xr[m][j] = ld16(x + (size_t)m * HID + j * 512 + lane * 8);
+    for (int j = 0; j < 4; ++j) xm[j] = ld16(x + (size_t)m * HID + j * 512 + lane * 8);
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      float acc = 0.f;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) dot8(w[q][j], xm[j], acc);
+      o[q][m] = wave_sum(acc);
+    }
+  }
 }
 
+// Dot products of two K=2048 weight rows (r1 may be null) with the M rows of x; one wave.
+// x is re-read per call (L1/L2-resident) so it does not hold registers across phases.
 template <int M>
-DEVI void gemv_pair(const uint16_t* r0, const uint16_t* r1, const uint4 (&xr)[M][4], int lane,
-                    float (&o)[2][M]) {
+DEVI void gemv_pair(const uint16_t* r0, const uint16_t* r1, const uint16_t* x, int lane, float (&o)[2][M]) {
   uint4 w[2][4];
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     w[0][j] = ld16(r0 + j * 512 + lane * 8);
     w[1][j] = r1 ? ld16(r1 + j * 512 + lane * 8) : make_uint4(0u, 0u, 0u, 0u);
   }
-#pragma unroll
-  for (int q = 0; q < 2; ++q)
-#pragma unroll
-    for (int m = 0; m < M; ++m) {
-      float a = 0.f;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) dot8(w[q][j], xr[m][j], a);
-      o[q][m] = wave_sum(a);
-    }
+  gemv_dots<M>(w, x, lane, o);
 }
 
 template <int M>
@@ -194,9 +196,6 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
   __shared__ int s_wcnt[WPB];
   __shared__ int s_nu;
 
-  uint4 xr[M][4];
-  load_x<M>(a.x, lane, xr);
-
   // ---- phase A: router rows (pair tasks 0..127), arrive; shared gate_up (128..383), gate (384)
   constexpr int NRP = NROUTER / 2, NSP = NSGU / 2, NTASK_A = NRP + NSP + 1;
   int t = gw;
@@ -204,7 +203,7 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
     const int n = 2 * t;
     const uint16_t* W = a.w_router + (size_t)n * HID;
     float o[2][M];
-    gemv_pair<M>(W, W + HID, xr, lane, o);
+    gemv_pair<M>(W, W + HID, a.x, lane, o);
     if (lane == 0)
 #pragma unroll
       for (int m = 0; m < M; ++m)
@@ -218,13 +217,13 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
     if (t < NRP + NSP) {
       const int n = 2 * (t - NRP);
       const uint16_t* W = a.w_sgu + (size_t)n * HID;
-      gemv_pair<M>(W, W + HID, xr, lane, o);
+      gemv_pair<M>(W, W + HID, a.x, lane, o);
       if (lane == 0)
 #pragma unroll
         for (int m = 0; m < M; ++m)
           *reinterpret_cast<uint32_t*>(r + m * R_STRIDE + NROUTER + n) = f2bf(o[0][m]) | (f2bf(o[1][m]) << 16);
     } else {
-      gemv_pair<M>(a.w_sgate, nullptr, xr, lane, o);
+      gemv_pair<M>(a.w_sgate, nullptr, a.x, lane, o);
       if (lane == 0)
 #pragma unroll
         for (int m = 0; m < M; ++m) gate[m] = o[0][m];
@@ -310,34 +309,58 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
     __syncthreads();
   }
 
-  // ---- w13 tiles of the distinct experts: task = (expert, intermediate column i)
+  // ---- w13 tiles of the distinct experts: task = (expert, intermediate column i). The next
+  // task's weights are loaded before the current task's math, so each wave keeps two tasks of
+  // HBM reads in flight (one workgroup per CU leaves one wave per SIMD to hide latency).
   {
-    const int nu = s_nu;
-    for (int t2 = gw; t2 < nu * INTER; t2 += NW) {
+    const int ntask = s_nu * INTER;
+    uint4 wc[2][4], wn[2][4];
+    auto load13 = [&](int t, uint4 (&w)[2][4]) {
+      const uint16_t* W = a.w13 + (size_t)s_ulist[t / INTER] * NSGU * HID + (size_t)(t % INTER) * HID;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        w[0][j] = ld16(W + j * 512 + lane * 8);
+        w[1][j] = ld16(W + (size_t)INTER * HID + j * 512 + lane * 8);
+      }
+    };
+    if (gw < ntask) load13(gw, wc);
+    for (int t2 = gw; t2 < ntask; t2 += NW) {
+      if (t2 + NW < ntask) load13(t2 + NW, wn);
       const int u = t2 / INTER, i = t2 % INTER;
-      const uint16_t* W = a.w13 + (size_t)s_ulist[u] * NSGU * HID;
       float o[2][M];
-      gemv_pair<M>(W + (size_t)i * HID, W + (size_t)(INTER + i) * HID, xr, lane, o);
+      gemv_dots<M>(wc, a.x, lane, o);
       if (lane == 0)
 #pragma unroll
         for (int m = 0; m < M; ++m) {
           const int k = s_slot[u][m];
           if (k >= 0) act[(m * TOPK + k) * INTER + i] = (uint16_t)f2bf(silu(bfr(o[0][m])) * bfr(o[1][m]));
         }
+#pragma unroll
+      for (int q = 0; q < 2; ++q)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) wc[q][j] = wn[q][j];
     }
   }
   grid_barrier(sync);
   if (blockIdx.x == 0 && tid == 0) __hip_atomic_store(sync + S_ROUTER, 0u, __ATOMIC_RELAXED, AGENT);
 
-  // ---- phase B: task = (row pair p, token m); half-wave per output row
+  // ---- phase B: task = (row pair p, token m); half-wave per output row. The next task's w2
+  // and shared-down rows are prefetched as above; act and r are small and L2-resident.
   {
     const int half = lane >> 5, kk = (lane & 31) * 8;
-    for (int t3 = gw; t3 < M * (HID / 2); t3 += NW) {
-      const int m = t3 / (HID / 2), row = 2 * (t3 % (HID / 2)) + half;
-      uint4 wv[TOPK], av[TOPK];
+    const int ntask = M * (HID / 2);
+    uint4 wc[TOPK], wn[TOPK], sc, sn;
+    auto load2 = [&](int t, uint4 (&wv)[TOPK], uint4& sw) {
+      const int m = t / (HID / 2), row = 2 * (t % (HID / 2)) + half;
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) wv[k] = ld16(a.w2 + ((size_t)s_ids[m][k] * HID + row) * INTER + kk);
-      const uint4 sw = ld16(a.w_sdown + (size_t)row * INTER + kk);
+      sw = ld16(a.w_sdown + (size_t)row * INTER + kk);
+    };
+    if (gw < ntask) load2(gw, wc, sc);
+    for (int t3 = gw; t3 < ntask; t3 += NW) {
+      if (t3 + NW < ntask) load2(t3 + NW, wn, sn);
+      const int m = t3 / (HID / 2), row = 2 * (t3 % (HID / 2)) + half;
+      uint4 av[TOPK];
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) av[k] = ld16(act + (m * TOPK + k) * INTER + kk);
       const uint4 g4 = ld16(r + m * R_STRIDE + NROUTER + kk);
@@ -346,7 +369,7 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) {
         float d = 0.f;
-        dot8(wv[k], av[k], d);
+        dot8(wc[k], av[k], d);
         d = half_sum(d);
         routed += bfr(d * s_w[m][k]);
       }
@@ -356,10 +379,13 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
       sa.z = f2bf(silu(lo(g4.z)) * lo(u4.z)) | (f2bf(silu(hi(g4.z)) * hi(u4.z)) << 16);
       sa.w = f2bf(silu(lo(g4.w)) * lo(u4.w)) | (f2bf(silu(hi(g4.w)) * hi(u4.w)) << 16);
       float sd = 0.f;
-      dot8(sw, sa, sd);
+      dot8(sc, sa, sd);
       sd = half_sum(sd);
       const float sig = 1.0f / (1.0f + expf(-gate[m]));
       if ((lane & 31) == 0) a.out[(size_t)m * HID + row] = (uint16_t)f2bf(bfr(routed) + sig * bfr(sd));
+#pragma unroll
+      for (int k = 0; k < TOPK; ++k) wc[k] = wn[k];
+      sc = sn;
     }
   }
 }
