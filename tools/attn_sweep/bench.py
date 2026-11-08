@@ -359,8 +359,37 @@ def extend_sweep():
                   flush=True)
 
 
+def intree():
+    """The tree's own launch geometry (no overrides), at the old and new split caps."""
+    print(f"# in-tree: device {torch.cuda.get_device_name(0)} CUs={CORES} "
+          f"gfx90a={getattr(da, '_is_gfx90a', None)}", flush=True)
+    gen = torch.Generator(device=DEV).manual_seed(0)
+    for bs in (1, 2, 4):
+        for ctx in (2048, 4096, 8192):
+            s = decode_setup(bs, ctx, gen)
+            cells = []
+            for cap in (16, 32):
+                out = torch.empty(bs, HQ, D, dtype=torch.bfloat16, device=DEV)
+                fn, _ = decode_fn(s, cap, out)
+                cells.append(f"cap{cap}={graph_us(fn):6.1f}")
+            print(f"decode bs{bs} ctx{ctx}: " + " ".join(cells), flush=True)
+            del s
+    for ext in (200, 600, 1500):
+        s = extend_setup(ext, 3072, gen)
+        out = torch.empty(ext, HQ, D, dtype=torch.bfloat16, device=DEV)
+
+        def fn(s=s, out=out):
+            for l in range(LAYERS):
+                extend_call(s, out, l)
+
+        print(f"extend ext{ext}: {graph_us(fn, reps=5):7.1f} us", flush=True)
+
+
 if __name__ == "__main__":
     torch.cuda.set_device(0)
+    if "--intree" in sys.argv:
+        intree()
+        sys.exit(0)
     for part in (decode_sweep, extend_sweep):
         try:
             part()
