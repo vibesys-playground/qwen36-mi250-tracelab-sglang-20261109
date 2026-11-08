@@ -222,12 +222,165 @@ struct SkgEntry {
   SKG_C(2, 8, 2, 1, 32, 8)
 #endif
 
-#ifndef SKG_TABLE
-#error "define SKG_TABLE (production configs) or SKG_SWEEP"
-#endif
-
+#ifdef SKG_TABLE
 static const SkgEntry kTable[] = {SKG_TABLE};
 static const int kTableLen = sizeof(kTable) / sizeof(kTable[0]);
+#else
+static const SkgEntry kTable[1] = {{0, 0, 0, 0, 0, 0, 0, nullptr}};
+static const int kTableLen = 0;
+#endif
+
+// ------------------------------------------------------------------------------------------
+// MFMA variant (skq): y^T tile = x[16, K] x w^T[K, 16 rows] through v_mfma_f32_16x16x16bf16_1k.
+// x is always padded to 16 MFMA rows (rows >= M re-read row M-1 and are never stored); the
+// MFMA output (m, n) depends only on row m of x and row n of w, and the instruction sequence
+// does not depend on M, so a row's bits do not depend on how many rows share the call.
+// Each lane loads one dwordx4 (8 consecutive k) of its weight row straight into registers and
+// feeds its two halves to two MFMAs; x is loaded with the same k mapping, so the pairing of
+// A and B along k is consistent. A wave owns R tiles of 16 rows over K / P; the P parts are
+// summed in wave order through LDS. DL selects the C/D lane layout: 0 = (m = 4*(lane/16)+q,
+// n = lane%16), 1 = the transpose.
+
+typedef short s16x4 __attribute__((ext_vector_type(4)));
+typedef float f32x4 __attribute__((ext_vector_type(4)));
+typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
+
+DEVI s16x4 lo_half(const u32x4 v) { return __builtin_bit_cast(s16x4, (u32x2){v.x, v.y}); }
+DEVI s16x4 hi_half(const u32x4 v) { return __builtin_bit_cast(s16x4, (u32x2){v.z, v.w}); }
+
+template <int R, int CH, int G, int P, int DL, bool HB>
+__global__ void __launch_bounds__(64 * G * P)
+    skq_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+               const uint16_t* __restrict__ bias, uint16_t* __restrict__ y, int M, int N, int sx,
+               int sy, int stag) {
+  constexpr int NSEG = CH * P;  // segments of 32 k
+  constexpr int K = NSEG * 32;
+  constexpr int RW = 16 * R;    // rows of w per wave
+  __shared__ float red[P > 1 ? G : 1][P > 1 ? P : 1][P > 1 ? 16 * RW : 1];
+  const int lane = threadIdx.x & 63;
+  const int li = lane & 15;
+  const int lg = lane >> 4;
+  const int wave = threadIdx.x >> 6;
+  const int g = wave / P;
+  const int p = wave - g * P;
+  const int n0 = blockIdx.x * (G * RW) + g * RW;
+  const int rot = (int)((blockIdx.x * (unsigned)stag) % (unsigned)NSEG);
+
+  u32x4 wv[R][CH];
+#pragma unroll
+  for (int j = 0; j < CH; ++j) {
+    int seg = p * CH + j + rot;
+    if (seg >= NSEG) seg -= NSEG;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const int n = min(n0 + r * 16 + li, N - 1);
+      wv[r][j] = ldw<true>(reinterpret_cast<const u32x4*>(w + (size_t)n * K + seg * 32 + lg * 8));
+    }
+  }
+  const int mrow = min(li, M - 1);
+  u32x4 xv[CH];
+#pragma unroll
+  for (int j = 0; j < CH; ++j) {
+    int seg = p * CH + j + rot;
+    if (seg >= NSEG) seg -= NSEG;
+    xv[j] = *reinterpret_cast<const u32x4*>(x + (size_t)mrow * sx + seg * 32 + lg * 8);
+  }
+  // HB: every load is issued before the first MFMA (otherwise the compiler streams them).
+  if constexpr (HB) __builtin_amdgcn_sched_barrier(0);
+
+  f32x4 acc[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) acc[r] = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int j = 0; j < CH; ++j)
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      acc[r] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(lo_half(xv[j]), lo_half(wv[r][j]), acc[r],
+                                                         0, 0, 0);
+      acc[r] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(hi_half(xv[j]), hi_half(wv[r][j]), acc[r],
+                                                         0, 0, 0);
+    }
+
+  if constexpr (P == 1) {
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int m = DL == 0 ? 4 * lg + q : li;
+        const int n = n0 + r * 16 + (DL == 0 ? li : 4 * lg + q);
+        if (m < M && n < N) {
+          float s = acc[r][q];
+          if (bias != nullptr) s += bf2f(bias[n]);
+          y[(size_t)m * sy + n] = f2bf(s);
+        }
+      }
+  } else {
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int m = DL == 0 ? 4 * lg + q : li;
+        const int c = r * 16 + (DL == 0 ? li : 4 * lg + q);
+        red[g][p][m * RW + c] = acc[r][q];
+      }
+    __syncthreads();
+    for (int t = threadIdx.x; t < G * 16 * RW; t += 64 * G * P) {
+      const int c = t % RW;
+      const int m = (t / RW) % 16;
+      const int gg = t / (RW * 16);
+      const int n = blockIdx.x * (G * RW) + gg * RW + c;
+      if (m < M && n < N) {
+        float s = red[gg][0][m * RW + c];
+#pragma unroll
+        for (int q = 1; q < P; ++q) s += red[gg][q][m * RW + c];
+        if (bias != nullptr) s += bf2f(bias[n]);
+        y[(size_t)m * sy + n] = f2bf(s);
+      }
+    }
+  }
+}
+
+template <int R, int CH, int G, int P, int DL, bool HB>
+static int skq_launch_t(const void* x, const void* w, const void* b, void* y, int M, int N,
+                        int sx, int sy, int stag, hipStream_t s) {
+  constexpr int ROWS = G * R * 16;
+  hipLaunchKernelGGL((skq_kernel<R, CH, G, P, DL, HB>), dim3((N + ROWS - 1) / ROWS),
+                     dim3(64 * G * P), 0, s, (const uint16_t*)x, (const uint16_t*)w,
+                     (const uint16_t*)b, (uint16_t*)y, M, N, sx, sy, stag);
+  return (int)hipGetLastError();
+}
+
+struct SkqEntry {
+  int r, p, g, hb, nseg, dl;
+  skg_fn fn;
+};
+
+// One config = (R, P, G, HB, NSEG, DL); K = 32 * NSEG.
+#define SKQ_C(R, P, G, HB, NSEG, DL) \
+  {R, P, G, HB, NSEG, DL, &skq_launch_t<R, (NSEG) / (P), G, P, DL, (HB) != 0>},
+
+#ifdef SKG_SWEEP
+#define SKQ_DL(R, P, G, NSEG)                                                     \
+  SKQ_C(R, P, G, 0, NSEG, 0) SKQ_C(R, P, G, 0, NSEG, 1) SKQ_C(R, P, G, 1, NSEG, 0) \
+      SKQ_C(R, P, G, 1, NSEG, 1)
+#define SKQ_TABLE                                                                         \
+  /* K = 2048 */                                                                          \
+  SKQ_DL(1, 4, 1, 64) SKQ_DL(2, 4, 1, 64) SKQ_DL(1, 8, 1, 64) SKQ_DL(2, 8, 1, 64)         \
+  SKQ_DL(1, 16, 1, 64) SKQ_DL(2, 16, 1, 64) SKQ_DL(1, 4, 2, 64) SKQ_DL(2, 4, 2, 64)       \
+  SKQ_DL(1, 8, 2, 64) SKQ_DL(2, 8, 2, 64)                                                 \
+  /* K = 256 */                                                                           \
+  SKQ_DL(1, 1, 1, 8) SKQ_DL(2, 1, 1, 8) SKQ_DL(1, 2, 1, 8) SKQ_DL(2, 2, 1, 8)             \
+  SKQ_DL(1, 4, 1, 8) SKQ_DL(2, 4, 1, 8) SKQ_DL(1, 1, 2, 8) SKQ_DL(2, 1, 2, 8)             \
+  SKQ_DL(1, 2, 2, 8) SKQ_DL(2, 2, 2, 8) SKQ_DL(1, 4, 2, 8) SKQ_DL(2, 4, 2, 8)
+#endif
+
+#ifdef SKQ_TABLE
+static const SkqEntry kQTable[] = {SKQ_TABLE};
+static const int kQTableLen = sizeof(kQTable) / sizeof(kQTable[0]);
+#else
+static const SkqEntry kQTable[1] = {{0, 0, 0, 0, 0, 0, nullptr}};
+static const int kQTableLen = 0;
+#endif
 
 // Streaming-read ceiling: every lane issues 8 dwordx4 loads (nontemporal) and folds them.
 __global__ void __launch_bounds__(256) skg_read_kernel(const u32x4* __restrict__ w, long long n16,
@@ -279,6 +432,34 @@ int skg_launch(int idx, const void* x, const void* w, const void* b, void* y, in
                int sx, int sy, int stag, void* stream) {
   if (idx < 0 || idx >= kTableLen) return -1;
   return kTable[idx].fn(x, w, b, y, M, N, sx, sy, stag, (hipStream_t)stream);
+}
+
+int skq_count() { return kQTableLen; }
+
+int skq_entry(int i, int* out6) {
+  if (i < 0 || i >= kQTableLen) return -1;
+  const SkqEntry& e = kQTable[i];
+  out6[0] = e.r;
+  out6[1] = e.p;
+  out6[2] = e.g;
+  out6[3] = e.hb;
+  out6[4] = e.nseg;
+  out6[5] = e.dl;
+  return 0;
+}
+
+int skq_find(int r, int p, int g, int hb, int nseg, int dl) {
+  for (int i = 0; i < kQTableLen; ++i) {
+    const SkqEntry& e = kQTable[i];
+    if (e.r == r && e.p == p && e.g == g && e.hb == hb && e.nseg == nseg && e.dl == dl) return i;
+  }
+  return -1;
+}
+
+int skq_launch(int idx, const void* x, const void* w, const void* b, void* y, int M, int N,
+               int sx, int sy, int stag, void* stream) {
+  if (idx < 0 || idx >= kQTableLen) return -1;
+  return kQTable[idx].fn(x, w, b, y, M, N, sx, sy, stag, (hipStream_t)stream);
 }
 
 int skg_read(const void* w, long long n16, void* out, int blocks, void* stream) {
