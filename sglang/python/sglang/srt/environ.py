@@ -1113,6 +1113,9 @@ class Envs:
     # Send BF16 linears with at most 16 rows on gfx90a back to hipBLASLt instead of the
     # Triton split-K skinny GEMM (kernels/ops/gemm/skinny_gemm_hip.py).
     SGLANG_ROCM_DISABLE_SKINNY_GEMM = EnvBool(False)
+    # One-launch decode MoE block on gfx90a for BF16 Qwen3.5/3.6-MoE at M <= 8
+    # (kernels/aot/csrc/moe/hip_decode_moe_block.hip). Set to 0 to use the per-op path.
+    SGLANG_HIP_DECODE_MEGAKERNEL = EnvBool(True)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
