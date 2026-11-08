@@ -28,7 +28,7 @@ import torch.nn.functional as F
 DEV = torch.device("cuda", 0)
 HID, NE, INTER, TOPK = 2048, 256, 256, 8
 NLAYERS = 8
-MS = (1, 2, 4, 8)
+MS = (1, 2, 3, 4, 5, 6, 7, 8)
 RES = {}
 
 
