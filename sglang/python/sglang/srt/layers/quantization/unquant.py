@@ -72,6 +72,13 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx115 = _is_hip and is_gfx115_supported()
+_use_skinny_gemm = (
+    _is_hip
+    and "gfx90a" in torch.cuda.get_device_properties(0).gcnArchName
+    and not envs.SGLANG_ROCM_DISABLE_SKINNY_GEMM.get()
+)
+if _use_skinny_gemm:
+    from sglang.kernels.ops.gemm import skinny_gemm_hip
 # AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
 # initialize_bf16_gemm_config sets this on gfx95 in deterministic mode and
 # unquantized layers then skip AITER.
@@ -835,6 +842,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
+
+        elif _use_skinny_gemm and skinny_gemm_hip.applicable(x, layer.weight, bias):
+            return skinny_gemm_hip.skinny_linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 

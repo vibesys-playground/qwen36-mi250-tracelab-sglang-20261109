@@ -14,6 +14,7 @@ rows share the call.
 
 from __future__ import annotations
 
+import functools
 from typing import NamedTuple, Optional
 
 import torch
@@ -170,3 +171,42 @@ def default_config(n: int, k: int) -> SkinnyConfig:
 
 def supports(n: int, k: int, cfg: SkinnyConfig) -> bool:
     return k % (cfg.split_k * cfg.block_k) == 0
+
+
+# Larger weights (an lm_head) are bandwidth-bound in hipBLASLt already.
+_MAX_N = 16384
+
+
+@functools.lru_cache(maxsize=None)
+def _config_for(n: int, k: int) -> Optional[SkinnyConfig]:
+    cfg = default_config(n, k)
+    return cfg if supports(n, k, cfg) else None
+
+
+def applicable(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> bool:
+    k = x.shape[-1]
+    return (
+        x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and (bias is None or bias.dtype == torch.bfloat16)
+        and weight.dim() == 2
+        and weight.shape[1] == k
+        and weight.is_contiguous()
+        and 0 < x.numel() <= MAX_M * k
+        and weight.shape[0] <= _MAX_N
+        and not weight.requires_grad
+        and _config_for(weight.shape[0], k) is not None
+    )
+
+
+def skinny_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    n, k = weight.shape
+    x2 = x.reshape(-1, k)
+    if x2.stride(-1) != 1:
+        x2 = x2.contiguous()
+    y = skinny_gemm(x2, weight, bias, _config_for(n, k))
+    return y.view(*x.shape[:-1], n)
