@@ -228,6 +228,97 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
         self.assertEqual(req.kv.mamba_prev_track_seqlen, TRACK_INTERVAL)
 
 
+class TestMambaFinalTrackPoint(unittest.TestCase):
+    """A request that finishes by length snapshots its state on its last
+    decode step, whose seq_len is the length its finish inserts, even off the
+    track grid."""
+
+    # origin len 2 + max_new_tokens 9 - 1: the last decode step runs at
+    # seq_len 10, off the grid of 4.
+    MAX_NEW = 9
+    FINAL = 10
+
+    def _prepare(self, seq_len_before: int, overlap: bool = True):
+        req, batch = _make_batch()
+        req.sampling_params.max_new_tokens = self.MAX_NEW
+        batch.enable_overlap = overlap
+        batch.seq_lens = torch.tensor([seq_len_before], dtype=torch.int64)
+        batch.seq_lens_cpu = batch.seq_lens.clone()
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=torch.tensor([3], dtype=torch.int64),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+            ),
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+        ):
+            batch.prepare_for_decode()
+        return req, batch
+
+    def test_final_len(self):
+        req, _ = _make_batch()
+        req.sampling_params.max_new_tokens = self.MAX_NEW
+        self.assertEqual(req.mamba_final_track_seqlen(), self.FINAL)
+        req.sampling_params.max_new_tokens = 1
+        self.assertIsNone(req.mamba_final_track_seqlen())
+
+    def test_last_step_tracks_and_step_before_flags_next(self):
+        # seq_len 9 after the increment: not a boundary, but the next step is.
+        _, batch = self._prepare(self.FINAL - 2)
+        self.assertEqual(batch.mamba_track_mask_cpu, [False])
+        self.assertEqual(batch.mamba_track_mask_next_cpu, [True])
+        # seq_len 10 after the increment: the last step snapshots.
+        _, batch = self._prepare(self.FINAL - 1)
+        self.assertEqual(batch.mamba_track_mask_cpu, [True])
+        self.assertEqual(batch.mamba_track_mask.tolist(), [True])
+        self.assertEqual(batch.mamba_track_mask_next_cpu, [False])
+        # Without overlap there is no next mask.
+        _, batch = self._prepare(self.FINAL - 1, overlap=False)
+        self.assertEqual(batch.mamba_track_mask_cpu, [True])
+        self.assertIsNone(batch.mamba_track_mask_next_cpu)
+
+    def test_other_off_grid_steps_do_not_track(self):
+        _, batch = self._prepare(self.FINAL - 4)  # seq_len 7
+        self.assertEqual(batch.mamba_track_mask_cpu, [False])
+
+    def test_known_boundary_accepts_off_grid_final_len(self):
+        req, batch = _make_batch()
+        processor = _make_processor()
+        req.sampling_params.max_new_tokens = self.MAX_NEW
+        req.output_ids.extend([5] * (self.MAX_NEW - len(req.output_ids)))
+        req.kv.kv_committed_len = self.FINAL
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_ping_pong_empty = [False, False]
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 0
+        batch.mamba_track_buffer_indices = None
+        batch.req_to_token_pool = SimpleNamespace(
+            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx
+        )
+        with get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer",
+            mamba_track_interval=TRACK_INTERVAL,
+            _mamba_cache_chunk_size=TRACK_INTERVAL,
+        ):
+            processor._mamba_prefix_cache_update(
+                req, batch, _make_result(), 0, known_boundary=True
+            )
+            self.assertEqual(req.kv.mamba_next_track_idx, 1)
+            # The fallback boundary check agrees with the mask.
+            batch.mamba_decode_batch_idx_cpu = [req.decode_batch_idx]
+            self.assertEqual(
+                processor._mamba_check_track_boundary(req, batch, _make_result(), 0),
+                (True, self.FINAL),
+            )
+
+
 class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
     def test_freed_rows_are_inert_and_live_rows_preserve_mapping(self):
         for positions, expected in ((None, [0, 11]), ([1, 1], [0, 12])):
