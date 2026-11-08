@@ -312,10 +312,16 @@ def _seeded(rank, it, kb, n):
     return torch.randn(n, generator=g, device="cuda", dtype=torch.float32).to(torch.bfloat16)
 
 
-def _graph_time(fn_step, x0, pg, ops, comm_ctx):
-    """Capture `ops` chained calls of fn_step(x) -> x in one HIP graph, replay, us/op."""
+def _graph_time(fn_step, x0, pg, ops, comm_ctx, warm=None):
+    """Capture `ops` chained calls of fn_step(x) -> x in one HIP graph, replay, us/op.
+    `warm` runs eagerly on the capture stream first (hipBLASLt allocates its per-stream
+    workspace on the first GEMM, which is not allowed during capture)."""
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
+    if warm is not None:
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                warm(x0)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with comm_ctx():
@@ -341,7 +347,7 @@ def ca_worker(rank, world):
     import faulthandler
     import hashlib
 
-    faulthandler.dump_traceback_later(1000, exit=True)
+    faulthandler.dump_traceback_later(1080, exit=True)
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", rank=rank, world_size=world,
                             init_method="tcp://127.0.0.1:29593")
@@ -359,7 +365,29 @@ def ca_worker(rank, world):
             kernel_probe()
         except Exception as e:  # noqa: BLE001
             print("kernel_probe failed:", e, flush=True)
+    variants = [("stock", None)]
+    vdir = os.environ.get("CA_VARIANT_DIR")
+    if vdir:
+        variants.append(("fenced", vdir))
     all_pgs = [[dist.new_group(g, backend="gloo") for g in groups] for _, groups in CA_SETS]
+    for vname, vd in variants:
+        if vd is not None:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import ca_variant
+            from torch.utils.cpp_extension import load  # noqa: F401
+            mod = ca_variant.build(os.environ["CA_REPO_ROOT"], vd)
+            ca_variant.install(car.ops, mod)
+            if rank == 0:
+                print("VARIANT fenced installed from", mod.__file__, flush=True)
+        ca_sets_run(rank, world, vname, all_pgs, car, gather_physical_device_ids,
+                    is_full_nvlink, PyNcclCommunicator)
+    dist.barrier()
+    faulthandler.cancel_dump_traceback_later()
+    dist.destroy_process_group()
+
+
+def ca_sets_run(rank, world, vname, all_pgs, car, gather_physical_device_ids, is_full_nvlink,
+                PyNcclCommunicator):
     for (name, groups), pgs in zip(CA_SETS, all_pgs):
         mine = [(g, pg) for g, pg in zip(groups, pgs) if rank in g]
         dist.barrier()
@@ -370,7 +398,7 @@ def ca_worker(rank, world):
             ca = car.CustomAllreduce(group=pg, device=rank)
             nccl = PyNcclCommunicator(pg, device=rank)
             probe = torch.empty(4096, dtype=torch.bfloat16, device="cuda")
-            print(f"CAINIT {name} rank{rank} group={g_ranks} is_full_nvlink={fn} "
+            print(f"CAINIT[{vname}] {name} rank{rank} group={g_ranks} is_full_nvlink={fn} "
                   f"disabled={ca.disabled} full_nvlink={getattr(ca, 'full_nvlink', None)} "
                   f"max_size={getattr(ca, 'max_size', None)} "
                   f"should_custom_ar(8KB)={ca.should_custom_ar(probe)} "
@@ -393,12 +421,12 @@ def ca_worker(rank, world):
                     vals = [gathered[r] for r in g]
                     bad = [v for v in vals if isinstance(v, str) or v is None]
                     if bad:
-                        print(f"RESULT ca {name:18s} g{gi} {kb:5d}KB {bad[0]}", flush=True)
+                        print(f"RESULT ca[{vname}] {name:18s} g{gi} {kb:5d}KB {bad[0]}", flush=True)
                         continue
                     t = {k: max(v[k] for v in vals) for k in vals[0] if k.endswith("_us")}
                     c = vals[0]
                     same = all(v["hashes"] == vals[0]["hashes"] for v in vals)
-                    print(f"RESULT ca {name:18s} g{gi} {kb:5d}KB "
+                    print(f"RESULT ca[{vname}] {name:18s} g{gi} {kb:5d}KB "
                           f"ca_eager={t['ca_eager_us']:.1f} ca_graph={t['ca_graph_us']:.1f} "
                           f"nccl_graph={t['nccl_graph_us']:.1f} | in-context(after GEMM): "
                           f"gemm={t['gemm_us']:.1f} +ca={t['ca_ctx_us'] - t['gemm_us']:.1f} "
@@ -410,9 +438,6 @@ def ca_worker(rank, world):
                           f"maxerr_ulp={max(v['e_maxulp'] for v in vals):.2f} "
                           f"| ranks_bitwise_identical={same} iters={CORR_ITERS}",
                           flush=True)
-    dist.barrier()
-    faulthandler.cancel_dump_traceback_later()
-    dist.destroy_process_group()
 
 
 def _ulp_err(out, ref32):
@@ -465,14 +490,16 @@ def ca_bench_one(rank, g_ranks, pg, ca, nccl, kb):
     torch.manual_seed(rank)
     W = (torch.randn(HIDDEN, HIDDEN, device="cuda") * 0.02).to(torch.bfloat16)
     xm = torch.randn(rows, HIDDEN, device="cuda").to(torch.bfloat16)
-    res["gemm_us"] = _graph_time(lambda v: v @ W, xm, pg, ops, contextlib.nullcontext)
-    res["ca_ctx_us"] = _graph_time(lambda v: ca.custom_all_reduce(v @ W), xm, pg, ops, ca_ctx)
+    gw = lambda v: v @ W  # noqa: E731
+    res["gemm_us"] = _graph_time(gw, xm, pg, ops, contextlib.nullcontext, warm=gw)
+    res["ca_ctx_us"] = _graph_time(lambda v: ca.custom_all_reduce(v @ W), xm, pg, ops, ca_ctx,
+                                   warm=gw)
 
     def nccl_ctx_step(v):
         h = v @ W
         nccl.all_reduce(h)
         return h
-    res["nccl_ctx_us"] = _graph_time(nccl_ctx_step, xm, pg, ops, nccl_ctx)
+    res["nccl_ctx_us"] = _graph_time(nccl_ctx_step, xm, pg, ops, nccl_ctx, warm=gw)
 
     # --- correctness, graph mode: static input refreshed every iteration with fresh random
     # values; inside the graph a kernel writes h = 2*inp, then the AR reads h on both ranks.
@@ -518,6 +545,19 @@ def main():
     world = torch.cuda.device_count()
     if os.environ.get("TOPO_AR_MODE") == "ca":
         print("devices:", world, "mode: ca", flush=True)
+        # Build the fenced gfx90a variant once here; the workers then load the built module.
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import ca_variant
+            t0 = time.time()
+            vd = "/tmp/ca_variant_build"
+            ca_variant.build(root, vd)
+            os.environ["CA_VARIANT_DIR"] = vd
+            os.environ["CA_REPO_ROOT"] = root
+            print(f"fenced variant built in {time.time() - t0:.0f}s", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print("fenced variant build failed:", e, flush=True)
         mp.spawn(ca_worker, args=(world,), nprocs=world, join=True)
         return
     if os.environ.get("TOPO_AR_MODE") == "pynccl":
