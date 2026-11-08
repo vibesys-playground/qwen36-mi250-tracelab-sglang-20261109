@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -28,7 +29,9 @@ _is_hip = is_hip()
 
 
 if _is_hip:
-    from aiter.ops.shuffle import shuffle_weight
+    # aiter is absent from gfx90a images; only this int4-fp8 MoE path needs it.
+    if importlib.util.find_spec("aiter") is not None:
+        from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 

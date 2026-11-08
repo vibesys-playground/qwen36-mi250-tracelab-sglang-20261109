@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import threading
 from typing import TYPE_CHECKING, Any
@@ -104,7 +105,8 @@ def _rank_chunk_padding_loader(weight_loader, *, tp_size: int):
 # gfx950. Using the wrong layout silently corrupts the dequant scales.
 _is_gfx1250 = is_gfx1250_supported()
 
-if _is_hip:
+# aiter is absent from gfx90a images; only the MXFP4 MoE path needs it.
+if _is_hip and importlib.util.find_spec("aiter") is not None:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
     dynamic_mxfp4_quant = None

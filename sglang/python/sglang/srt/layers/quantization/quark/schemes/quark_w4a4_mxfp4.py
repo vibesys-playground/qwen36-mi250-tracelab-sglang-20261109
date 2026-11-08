@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import logging
 import threading
 from typing import Any, Callable, Optional
@@ -161,7 +162,8 @@ def _dequant_mxfp4_to_bf16(
     return w.to(torch.bfloat16)
 
 
-if _is_hip:
+# aiter is absent from gfx90a images; only the MXFP4 paths below need it.
+if _is_hip and importlib.util.find_spec("aiter") is not None:
     from aiter import gemm_a4w4 as _gemm_a4w4_orig
     from aiter import per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig
     from aiter.ops.shuffle import shuffle_weight
