@@ -32,6 +32,24 @@ METRICS = {
     "tpot_p50_ms": "tpot_ms_p50",
     "tpot_p90_ms": "tpot_ms_p90",
 }
+# Protocol-2 declaration of every metric the result reports (objectives.toml).
+HELLO = {
+    "kind": "hello",
+    "protocol": 2,
+    "metrics": {
+        "output_tokens_per_s": {"unit": "tokens/s", "direction": "max"},
+        "ttft_p50_ms": {"unit": "ms", "direction": "min"},
+        "ttft_p90_ms": {"unit": "ms", "direction": "min"},
+        "tpot_p50_ms": {"unit": "ms", "direction": "min"},
+        "tpot_p90_ms": {"unit": "ms", "direction": "min"},
+    },
+}
+
+
+def write_record(path: Path, record: dict[str, Any], *, first: bool = False) -> None:
+    """Write one protocol record line: truncate the stream if first, else append."""
+    with path.open("w" if first else "a") as stream:
+        stream.write(json.dumps(record, allow_nan=False) + "\n")
 
 
 def summary_metrics(summary: object, rounds: int, output_tokens: int) -> dict[str, float]:
@@ -175,24 +193,25 @@ def _run(args: argparse.Namespace, temporary: Path) -> dict[str, float]:
 
 
 def main() -> int:
-    """Run one recorded replay; emit a protocol error on any boundary failure."""
+    """Run one recorded replay; write a protocol-2 hello, then a result or error."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request-factory-engine", required=True)
     # vibesys-cli gives the candidate's server address in VIBESYS_SERVICE_URL.
     parser.add_argument("--url", default=os.environ.get("VIBESYS_SERVICE_URL", "http://localhost:8000"))
     parser.add_argument("--vs-output", type=Path, required=True)
     args = parser.parse_args()
-    record: dict[str, Any]
+    # Hello first, so a later crash still leaves a valid stream prefix.
+    write_record(args.vs_output, HELLO, first=True)
     try:
         with tempfile.TemporaryDirectory(prefix="qwen36-tracelab-") as directory:
             values = _run(args, Path(directory))
-        record = {"kind": "result", "label": "", "values": values}
+        record: dict[str, Any] = {"kind": "result", "label": "", "values": values}
         status = 0
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         record = {"kind": "error", "message": str(exc)}
         sys.stderr.write(f"TraceLab replay failed: {exc}\n")
         status = 1
-    args.vs_output.write_text(json.dumps(record, allow_nan=False) + "\n")
+    write_record(args.vs_output, record)
     return status
 
 
