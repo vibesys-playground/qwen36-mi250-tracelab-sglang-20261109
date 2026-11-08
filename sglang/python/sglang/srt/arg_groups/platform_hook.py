@@ -61,8 +61,15 @@ def handle_mps_backends(server_args: Any):
 
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
+        hip = current_arch().hip
+        # gfx90a (MI210/MI250, 104-110 CUs): with few q heads per KV head, a 16-split
+        # cap leaves most CUs idle in decode attention at small batches; 32 measured
+        # best at bs 1-4, ctx 2k-8k (stage 2 walks all MAX splits, so higher caps cost).
+        num_kv_splits = 32 if hip is not None and hip.gcn_arch == "gfx90a" else 16
         declare_resolution(
-            server_args, "_handle_amd_specifics", triton_attention_num_kv_splits=16
+            server_args,
+            "_handle_amd_specifics",
+            triton_attention_num_kv_splits=num_kv_splits,
         )
         # Above this the HIP runtime registers a pageable H2D source with the
         # GPU rather than staging it, and the MMU notifier on that registration
@@ -70,7 +77,6 @@ def handle_amd_specifics(server_args: Any):
         os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
         # gfx1250 lacks the fp4-activation WMMA scale instruction, so aiter's
         # fused_moe has to run MXFP4 experts as a8w4 there; aiter reads this.
-        hip = current_arch().hip
         if hip is not None and hip.gcn_arch == "gfx1250":
             os.environ.setdefault("AITER_FORCE_A8W4", "1")
 

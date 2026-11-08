@@ -39,6 +39,10 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+# Read at import like is_gfx95_supported (current_arch() is call-time only).
+_is_gfx90a = (
+    _is_hip and torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx90a"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -843,6 +847,12 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+        if _is_gfx90a and not has_mla and Lk == 256:
+            # gfx90a (MI210/MI250), head_dim 256: 64 tokens per iteration and two waves
+            # per EU halve the serial loop of each split and hide its load latency.
+            # Measured at 8 q / 1 kv heads, bs 1-4, ctx 2k-8k: 1.1-1.5x on stage 1.
+            BLOCK = 64
+            extra_kargs["waves_per_eu"] = 2
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
