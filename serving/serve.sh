@@ -33,6 +33,7 @@ fi
 # stays on the in-package link. prefix_affinity sends each session's later rounds to the
 # replica whose radix and recurrent-state cache holds its prefix; new sessions go to the
 # least-loaded replica.
+# Save recurrent state every 64 decode tokens (default 256) so later rounds' prefix hits cover more of the previous output.
 exec python3 -m sglang.launch_server "$@" \
   --tp-size 2 \
   --dp-size 4 \
@@ -41,4 +42,5 @@ exec python3 -m sglang.launch_server "$@" \
   --cuda-graph-backend-prefill breakable \
   --cuda-graph-max-bs-prefill 2816 \
   --enable-cache-report \
+  --mamba-track-interval 64 \
   --default-chat-template-kwargs '{"enable_thinking": false}'
