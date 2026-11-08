@@ -151,6 +151,18 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
+
+
+def hip_gemma_norm_is_triton() -> bool:
+    """GemmaRMSNorm.forward_hip runs the Triton add+norm with round_sum=True on 2-D input."""
+    return (
+        _is_hip
+        and not _use_aiter
+        and not _has_vllm_rms_norm
+        and _has_rocm_triton_gemma_rms_norm
+    )
+
+
 if _is_cuda:
     from sglang.kernels.ops.layernorm.norm import (
         fused_add_rmsnorm as _jit_fused_add_rmsnorm,

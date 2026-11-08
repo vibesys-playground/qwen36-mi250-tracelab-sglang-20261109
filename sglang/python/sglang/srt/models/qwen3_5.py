@@ -185,6 +185,16 @@ _qknorm_use_alt_stream = _is_cuda or (
 _is_hip_gfx90a = (
     _is_hip and "gfx90a" in torch.cuda.get_device_properties(0).gcnArchName
 )
+# gfx90a: one skinny-GEMM launch for in_proj_qkvz + in_proj_ba at decode, bitwise equal to the
+# two separate skinny GEMMs (tools/ar_norm/bench.py).
+_hip_packed_in_proj = (
+    _is_hip_gfx90a
+    and not _use_aiter
+    and not envs.SGLANG_ROCM_DISABLE_SKINNY_GEMM.get()
+    and get_bool_env_var("SGLANG_QWEN35_PACKED_IN_PROJ", "True")
+)
+if _hip_packed_in_proj:
+    from sglang.kernels.ops.gemm import skinny_gemm_packed_hip
 _gdn_decode_fused_proj_conv = (
     _is_cuda or _is_hip_gfx90a
 ) and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
@@ -232,11 +242,18 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
 
 
 def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
-    """The CuTe DSL kernels a layer tries before its own, when they are on."""
+    """The CuTe DSL kernels a layer tries before its own, when they are on, or on gfx90a
+    the HIP custom all-reduce with the residual add + norm fused in."""
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
         from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
+    if _is_hip_gfx90a and not _use_aiter and not is_nextn:
+        from sglang.srt.layers.layer_boundary.fusions.hip_ca_norm import (
+            hip_ca_norm_fusion,
+        )
+
+        return hip_ca_norm_fusion()
     return None
 
 
@@ -261,7 +278,11 @@ def _qwen3_5_stage_facts(
     )
 
 
-if _is_cuda:
+# gfx90a: the fused QK norm + mrope + gate prologue (EXPLICIT_ROPE_FMA and PDL stay off on HIP).
+_hip_fused_qk_rope_gate = (
+    _is_hip_gfx90a and envs.SGLANG_HIP_FUSED_QK_ROPE_GATE.get()
+)
+if _is_cuda or _hip_fused_qk_rope_gate:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
     )
@@ -711,10 +732,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         BF16 parameters alias the packed rows. FP8 keeps the original layouts
         for the separate path and publishes its derived-cache update constraint.
         """
-        if not (_is_cuda or _use_aiter) or self._fused_in_proj_weight is not None:
+        if (
+            not (_is_cuda or _use_aiter or _hip_packed_in_proj)
+            or self._fused_in_proj_weight is not None
+        ):
             return
         if (
-            _use_aiter
+            (_use_aiter or _hip_packed_in_proj)
             and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
         ):
             return
@@ -823,6 +847,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if _hip_packed_in_proj and self._fused_in_proj_weight is not None:
+            split = self._fused_in_proj_qkvz_width
+            if skinny_gemm_packed_hip.applicable(
+                hidden_states, self._fused_in_proj_weight, split
+            ):
+                fused_out = skinny_gemm_packed_hip.skinny_linear_pair(
+                    hidden_states, self._fused_in_proj_weight, split
+                )
+                if fused_out is not None:
+                    return fused_out[:, :split], fused_out[:, split:]
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -870,6 +904,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if (
             not _use_aiter
+            and not _hip_packed_in_proj
             and self._fused_in_proj_weight is not None
             and hidden_states.dtype == torch.bfloat16
             # Measured on cuBLAS above ~1k rows:
@@ -1605,7 +1640,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if _is_cuda and self.attn_output_gate:
+        if (_is_cuda or _hip_fused_qk_rope_gate) and self.attn_output_gate:
             return self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,

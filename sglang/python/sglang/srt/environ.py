@@ -1113,6 +1113,12 @@ class Envs:
     # Send BF16 linears with at most 16 rows on gfx90a back to hipBLASLt instead of the
     # Triton split-K skinny GEMM (kernels/ops/gemm/skinny_gemm_hip.py).
     SGLANG_ROCM_DISABLE_SKINNY_GEMM = EnvBool(False)
+    # gfx90a decode: the HIP custom all-reduce with the residual add + Gemma RMSNorm in its
+    # epilogue at layer inputs (layer_boundary/fusions/hip_ca_norm.py). Off: j114 measured
+    # 0.14 us saved per boundary at M=2, the epilogue costing about what the norm launch did.
+    SGLANG_HIP_AR_NORM_FUSION = EnvBool(False)
+    # gfx90a: Qwen3.5 attention prologue (QK Gemma RMSNorm + mrope + gate) as one Triton kernel.
+    SGLANG_HIP_FUSED_QK_ROPE_GATE = EnvBool(True)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
