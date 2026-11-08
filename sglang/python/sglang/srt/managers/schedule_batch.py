@@ -1106,6 +1106,22 @@ class Req(ReqDllmMixin):
         # Whether committing one more output token reaches max_new_tokens
         return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
 
+    def mamba_final_track_seqlen(self) -> Optional[int]:
+        """Depth of the recurrent state the last output token is sampled from
+        when the request finishes by max_new_tokens.
+
+        The decode step that samples output token ``max_new_tokens`` runs with
+        seq_len = len(origin) + max_new_tokens - 1, which is also the length
+        the finished request inserts into the radix tree (its last token has
+        no KV). Snapshotting that step's state lets the tree keep a mamba
+        checkpoint at the full inserted length instead of the last grid point.
+        None when no decode step reaches it (max_new_tokens < 2 or unset).
+        """
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if max_new_tokens is None or max_new_tokens < 2:
+            return None
+        return len(self.origin_input_ids) + max_new_tokens - 1
+
     @property
     def extend_len(self) -> int:
         return self.extend_end - self.prefix_len
@@ -1748,6 +1764,32 @@ def mamba_lazy_spec_in_window(
     seq_len = req.kv.kv_committed_len
     window = 2 * max_draft_tokens
     return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
+
+
+def _mamba_add_final_track_points(
+    reqs, seq_lens_cpu: torch.Tensor, track_mask_cpu: torch.Tensor, track_mask_next_cpu
+):
+    """Mark the decode step whose seq_len equals a request's
+    mamba_final_track_seqlen() as a track boundary, and (under overlap) the
+    step before it as preceding a boundary, exactly as a grid boundary would
+    be marked, so the ping-pong bookkeeping treats both the same way."""
+    seq_lens = seq_lens_cpu.tolist()
+    hits, next_hits = [], []
+    for i, (req, seq_len) in enumerate(zip(reqs, seq_lens)):
+        final_len = req.mamba_final_track_seqlen()
+        if final_len is None:
+            continue
+        if seq_len == final_len:
+            hits.append(i)
+        elif seq_len + 1 == final_len:
+            next_hits.append(i)
+    if hits:
+        track_mask_cpu = track_mask_cpu.clone()
+        track_mask_cpu[hits] = True
+    if next_hits and track_mask_next_cpu is not None:
+        track_mask_next_cpu = track_mask_next_cpu.clone()
+        track_mask_next_cpu[next_hits] = True
+    return track_mask_cpu, track_mask_next_cpu
 
 
 def set_mamba_track_indices_from_reqs(
@@ -3286,11 +3328,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                 set_mamba_track_indices_from_reqs(self)
 
-            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
-            self.mamba_track_mask_next_cpu = (
-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+            track_mask_next_cpu = (
+                (track_remainders_cpu == mamba_track_interval - 1)
                 if self.enable_overlap
                 else None
+            )
+            if len(self.reqs) > 0 and not get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                # Off-grid final snapshot: the step that samples a request's
+                # last token (by length) also tracks, so finish donates the
+                # state at the full inserted length. It is one more masked row
+                # of the same per-step copy, only on that request's last step.
+                track_mask_cpu, track_mask_next_cpu = _mamba_add_final_track_points(
+                    self.reqs, self.seq_lens_cpu, track_mask_cpu, track_mask_next_cpu
+                )
+            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+            self.mamba_track_mask_next_cpu = (
+                track_mask_next_cpu.tolist() if track_mask_next_cpu is not None else None
             )
             # ScheduleBatch.copy() snapshots the list of requests, but the Req
             # objects remain shared. The next overlapped decode can therefore

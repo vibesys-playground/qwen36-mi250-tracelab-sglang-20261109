@@ -1681,7 +1681,10 @@ class SchedulerBatchResultProcessor:
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv.kv_committed_len
-            assert track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
+            assert (
+                track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
+                or track_seqlen == req.mamba_final_track_seqlen()
+            )
             at_boundary = True
         else:
             at_boundary, track_seqlen = self._mamba_check_track_boundary(
@@ -1803,7 +1806,10 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none():
             lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
             committed_len = req.kv.kv_committed_len - lookahead
-            if committed_len % interval == 0:
+            if committed_len % interval == 0 or (
+                not get_exec().mamba.enable_mamba_extra_buffer_lazy
+                and committed_len == req.mamba_final_track_seqlen()
+            ):
                 return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
