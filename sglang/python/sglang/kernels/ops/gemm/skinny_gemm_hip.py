@@ -157,14 +157,29 @@ def skinny_gemm(
     return y
 
 
+# Schedules measured on an MI210 (gfx90a, 104 CUs) with HIP-graph replay at M = 2 and 16
+# over block_n 16-64, block_k 128-512, split_k 1-16, 4 or 8 warps (tools/skinny_gemm).
+_TUNED: dict[tuple[int, int], SkinnyConfig] = {
+    (6144, 2048): SkinnyConfig(64, 128, 2),
+    (4608, 2048): SkinnyConfig(64, 128, 2),
+    (2048, 2048): SkinnyConfig(64, 128, 16),
+    (512, 2048): SkinnyConfig(64, 128, 16),
+    (256, 2048): SkinnyConfig(16, 128, 16),
+    (32, 2048): SkinnyConfig(16, 128, 16),
+    (2048, 256): SkinnyConfig(64, 128, 1),
+}
+
+
 def default_config(n: int, k: int) -> SkinnyConfig:
     """The fixed schedule for an (N, K) weight; a function of the shape only, never of M."""
-    # Aim for about two workgroups per CU of a 104/110-CU gfx90a GCD.
-    block_k = 256
-    block_n = 16 if n <= 8192 else 64
+    if (n, k) in _TUNED:
+        return _TUNED[(n, k)]
+    # Untuned shapes: split K until the grid is about two workgroups per CU.
+    block_k = 128
+    block_n = 16 if n <= 256 else 64
     grid_n = triton.cdiv(n, block_n)
     split_k = 1
-    while grid_n * split_k < 192 and k // (split_k * 2) >= block_k and split_k < 16:
+    while grid_n * split_k < 192 and k % (split_k * 2 * block_k) == 0 and split_k < 16:
         split_k *= 2
     return SkinnyConfig(block_n, block_k, split_k)
 
