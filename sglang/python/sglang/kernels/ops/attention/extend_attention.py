@@ -32,6 +32,10 @@ from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+# Read at import like is_gfx95_supported (current_arch() is call-time only).
+_is_gfx90a = (
+    _is_hip and torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx90a"
+)
 
 try:
     _triton_version_parts = tuple(
@@ -1081,6 +1085,11 @@ def extend_attention_fwd(
     extra_kargs = {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        if _is_gfx90a and Lq == 256:
+            # gfx90a, head_dim 256, 64x64 tiles: two waves per EU let a CU overlap two
+            # workgroups' prefix streams. Measured on a 3k prefix: 1.03x at 200 new
+            # tokens, 1.05x at 600, 1.48x at 1500.
+            extra_kargs["waves_per_eu"] = 2
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size

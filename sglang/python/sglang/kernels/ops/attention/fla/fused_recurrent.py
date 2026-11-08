@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -10,7 +11,12 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
+
+
+@lru_cache(maxsize=1)
+def _is_hip_gfx90a() -> bool:
+    return is_hip() and "gfx90a" in torch.cuda.get_device_properties(0).gcnArchName
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -371,6 +377,15 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         and initial_state.dtype == torch.float32
         and (HV, V, K) == (12, 128, 128)
         and torch.cuda.get_device_capability(mixed_qkv.device)[0] == 10
+    )
+    # gfx90a: BV=32 gives B*HV*4 one-wave workgroups, about one per CU at decode
+    # batch sizes. BV=8 is bitwise equal (same one-warp K reductions) and faster
+    # for B=1..8 at HV=16, V=K=128 (tools/gdn_decode/bench.py); larger B is unmeasured.
+    use_small_value_tile = use_small_value_tile or (
+        _is_hip_gfx90a()
+        and B <= 8
+        and initial_state.dtype == torch.float32
+        and (V, K) == (128, 128)
     )
     BV = min(triton.next_power_of_2(V), 8 if use_small_value_tile else 32)
     num_stages = 3

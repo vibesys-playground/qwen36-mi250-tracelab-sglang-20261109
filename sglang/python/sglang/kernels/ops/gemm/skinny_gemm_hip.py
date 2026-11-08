@@ -6,8 +6,9 @@ gives every workgroup a [BLOCK_N, K / SPLIT_K] slab of the weight, read once for
 (up to 16) rows of x through MFMA ``tl.dot``, so the grid covers the GCD's CUs.
 
 Numerics: BF16 inputs, FP32 accumulation, BF16 output. With SPLIT_K > 1 each split writes
-FP32 partials and a second kernel sums them in a fixed order (split 0, 1, ...); there are
-no atomics. The schedule (tile sizes, split count) is a function of (N, K) only and x is
+FP32 partials, and the last block of each N tile to finish (elected by an int32 ticket
+counter) sums them in a fixed order (split 0, 1, ...) inside the same kernel; no float
+atomics, and the sum order does not depend on which block arrives last. The schedule (tile sizes, split count) is a function of (N, K) only and x is
 always padded to one 16-row tile, so a row's result does not depend on how many other
 rows share the call.
 """
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import NamedTuple, Optional
 
 import torch
@@ -43,6 +45,7 @@ def _skinny_gemm_kernel(
     b_ptr,
     y_ptr,
     ws_ptr,
+    cnt_ptr,
     M,
     N,
     K,
@@ -54,6 +57,7 @@ def _skinny_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    FUSED_REDUCE: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -81,6 +85,56 @@ def _skinny_gemm_kernel(
     else:
         ws_ptrs = ws_ptr + pid_k * M * N + offs_m[:, None] * N + offs_n[None, :]
         tl.store(ws_ptrs, acc, mask=mask)
+        if FUSED_REDUCE:
+            _last_block_reduce(
+                ws_ptr, b_ptr, y_ptr, cnt_ptr, pid_n, offs_m, offs_n, mask, mask_n,
+                M, N, stride_ym, HAS_BIAS, SPLIT_K,
+            )
+
+
+@triton.jit
+def _wait_vm_stores(dep):
+    tl.inline_asm_elementwise(
+        "s_waitcnt vmcnt(0)", "=v,v", [dep], dtype=tl.int32, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _last_block_reduce(
+    ws_ptr, b_ptr, y_ptr, cnt_ptr, pid_n, offs_m, offs_n, mask, mask_n,
+    M, N, stride_ym, HAS_BIAS: tl.constexpr, SPLIT_K: tl.constexpr,
+):
+    """Sum the SPLIT_K partials of this [16, BLOCK_N] tile in split order 0, 1, ...
+
+    Every (pid_n, pid_k) block takes a ticket from ``cnt[pid_n]`` after its partial is
+    stored; the block that draws the last ticket does the sum. The ticket only elects
+    that block: the sum always runs over splits 0..SPLIT_K-1 in index order, exactly as
+    ``_ordered_reduce_kernel`` does, so the result is bitwise the same as the two-kernel
+    path whichever block arrives last.
+
+    Memory ordering (gfx90a): every wave waits ``vmcnt(0)`` so its partial stores have
+    reached L2 (L2 is the device coherence point; L1 is write-through), the barrier
+    orders all waves before the ticket, the ticket is an agent-scope acq_rel atomic
+    (release before it, ``buffer_wbinvl1_vol`` after it), and the partials are re-read
+    with ``.cg`` so they come from L2, never from a stale line in this CU's L1.
+    """
+    # Each wave waits until its own partial stores are acknowledged by L2 (Triton's
+    # barrier waits on LDS only), then the barrier orders all waves before the ticket.
+    _wait_vm_stores(pid_n)
+    tl.debug_barrier()
+    ticket = tl.atomic_add(cnt_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+    if ticket == SPLIT_K - 1:
+        base = ws_ptr + offs_m[:, None] * N + offs_n[None, :]
+        tot = tl.load(base, mask=mask, other=0.0, cache_modifier=".cg")
+        for s in tl.static_range(1, SPLIT_K):
+            tot += tl.load(base + s * M * N, mask=mask, other=0.0, cache_modifier=".cg")
+        if HAS_BIAS:
+            tot += tl.load(b_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)[None, :]
+        y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :]
+        tl.store(y_ptrs, tot.to(y_ptr.dtype.element_ty), mask=mask)
+        # Every block of this call has taken its ticket: re-arm the counter for the next
+        # call on this stream (and for the next graph replay) without a memset.
+        tl.atomic_xchg(cnt_ptr + pid_n, 0, sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -107,28 +161,68 @@ def _ordered_reduce_kernel(
     tl.store(y_ptr + m * stride_ym + n, acc.to(y_ptr.dtype.element_ty), mask=mask)
 
 
+# Arrival-ticket counters of the fused split-K reduce: one int32 per N tile, zero between
+# calls (the last block of each tile re-arms its own), one buffer per device. Calls that
+# share it must not overlap, which holds while a device runs its skinny GEMMs on one stream
+# at a time: on HIP the Qwen3.5/3.6 models use an alternate stream only when
+# SGLANG_ALT_STREAM is set, and then the two-kernel reduce is used. The buffer is
+# allocated on the first eager call, never inside graph capture (which falls back).
+_COUNTER_LEN = 4096
+_counters: dict[int, torch.Tensor] = {}
+_fused_reduce_ok = os.environ.get("SGLANG_ALT_STREAM", "").lower() not in ("1", "true", "yes")
+_warned_capture_fallback = False
+
+
+def _ticket_counters(device: torch.device) -> Optional[torch.Tensor]:
+    global _warned_capture_fallback
+    buf = _counters.get(device.index)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            if not _warned_capture_fallback:
+                _warned_capture_fallback = True
+                logger.warning(
+                    "skinny GEMM: first split-K call on device %s is inside graph "
+                    "capture; it uses the two-kernel reduce",
+                    device,
+                )
+            return None
+        buf = torch.zeros(_COUNTER_LEN, dtype=torch.int32, device=device)
+        _counters[device.index] = buf
+    return buf
+
+
 def skinny_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
     bias: Optional[torch.Tensor],
     cfg: SkinnyConfig,
+    fused_reduce: bool = True,
 ) -> torch.Tensor:
-    """y = x @ w.T + bias for 2-D ``x`` [M <= 16, K] and contiguous ``w`` [N, K]."""
+    """y = x @ w.T + bias for 2-D ``x`` [M <= 16, K] and contiguous ``w`` [N, K].
+
+    With split_k > 1 the splits are summed in split order inside the GEMM by the last
+    block of each N tile (``fused_reduce``), or by a second kernel; both give the same bits.
+    """
     M, K = x.shape
     N = w.shape[0]
     y = torch.empty((M, N), dtype=x.dtype, device=x.device)
     grid_n = triton.cdiv(N, cfg.block_n)
     has_bias = bias is not None
+    cnt = None
     if cfg.split_k == 1:
         ws = y
     else:
         ws = torch.empty((cfg.split_k, M, N), dtype=torch.float32, device=x.device)
+        if fused_reduce and _fused_reduce_ok and grid_n <= _COUNTER_LEN:
+            cnt = _ticket_counters(x.device)
+    fused = cnt is not None
     _skinny_gemm_kernel[(grid_n, cfg.split_k)](
         x,
         w,
         bias if has_bias else w,
         y,
         ws,
+        cnt if fused else ws,
         M,
         N,
         K,
@@ -140,10 +234,11 @@ def skinny_gemm(
         BLOCK_N=cfg.block_n,
         BLOCK_K=cfg.block_k,
         SPLIT_K=cfg.split_k,
+        FUSED_REDUCE=fused,
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
     )
-    if cfg.split_k > 1:
+    if cfg.split_k > 1 and not fused:
         block = 256
         _ordered_reduce_kernel[(triton.cdiv(M * N, block),)](
             ws,

@@ -180,9 +180,14 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-_gdn_decode_fused_proj_conv = (
-    _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
+# On gfx90a the fused unpack+Conv1D decode tail is bitwise equal to split+Conv1D
+# (tools/gdn_decode/bench.py) and saves one launch per GDN layer.
+_is_hip_gfx90a = (
+    _is_hip and "gfx90a" in torch.cuda.get_device_properties(0).gcnArchName
 )
+_gdn_decode_fused_proj_conv = (
+    _is_cuda or _is_hip_gfx90a
+) and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 _gdn_online_mxfp4 = (
     ("in_proj_qkvz", "out_proj")
     if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
