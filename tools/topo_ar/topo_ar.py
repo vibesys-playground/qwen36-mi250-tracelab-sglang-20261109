@@ -100,7 +100,9 @@ def bench_group(rank, pg, size_kb, mode):
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    # thread_local: the ProcessGroupNCCL watchdog thread queries events while this thread
+    # captures; in the default global mode that query invalidates the capture.
+    with torch.cuda.graph(g, capture_error_mode="thread_local"):
         for _ in range(ops):
             dist.all_reduce(x, group=pg)
     torch.cuda.synchronize()
@@ -124,12 +126,12 @@ def worker(rank, world):
     if rank == 0:
         topology()
     dist.barrier()
-    results = []
-    for name, groups in GROUP_SETS:
-        # new_group must be called by every rank, for every group, in the same order.
-        pgs = [dist.new_group(g) for g in groups]
-        mine = [(g, pg) for g, pg in zip(groups, pgs) if rank in g]
-        for mode in ("eager", "graph"):
+    # new_group must be called by every rank, for every group, in the same order.
+    all_pgs = [[dist.new_group(g) for g in groups] for _, groups in GROUP_SETS]
+    # All eager numbers first, so a failed graph capture cannot lose them.
+    for mode in ("eager", "graph"):
+        for (name, groups), pgs in zip(GROUP_SETS, all_pgs):
+            mine = [(g, pg) for g, pg in zip(groups, pgs) if rank in g]
             for kb in SIZES_KB:
                 dist.barrier()
                 val = None
