@@ -207,20 +207,20 @@ def main_v3():
             if m == 2:
                 log(f"s vs e {name}: max|diff| {d:.4g}")
 
-    # ---------------- (h) sweep per (N, K) with K % 512 == 0
+    # ---------------- (h) sweep per (N, K): pick the fastest config at M=2 whose M=16 time is
+    # within 3% of e's; shapes without one keep e (decided below from the full tables).
     t0 = time.time()
+    e_t = {}
+    for name, n, k, _ in SHAPES:
+        e_t[name] = {m: per_shape(ops["e"], ws, xs, name, m) for m in (2, 16)}
     h_cfg = {}
-    h_rows = {}
     for (n, k), names in NAME_OF.items():
         name = names[0]
-        if k % hg.SEG != 0:
-            continue
-        nseg = k // hg.SEG
         rows = []
-        for base in lib.configs(nseg):
+        for base in lib.configs(k):
             for stag in (1, 0):
                 cfg = base._replace(stag=stag)
-                idx = {mb: lib.find(mb, cfg, nseg) for mb in hg.MBS}
+                idx = {mb: lib.find(mb, cfg, k) for mb in hg.MBS}
                 op = lambda x, w, _n, c=cfg, ix=idx: hg.gemv(lib, x, w, None, c, ix[hg.mb_of(x.shape[0])])
                 try:
                     t2 = per_shape(op, ws, xs, name, 2)
@@ -228,27 +228,36 @@ def main_v3():
                 except Exception as ex:  # noqa: BLE001
                     log("h cfg fail", name, cfg, repr(ex)[:300])
                     continue
-                rows.append((t2 + 0.25 * t16, t2, t16, cfg))
-        rows.sort(key=lambda r: r[0])
-        h_rows[(n, k)] = rows
-        log(f"[sweep h] {name} N={n} K={k}: {len(rows)} configs, top 10 (score = M2 + 0.25*M16)")
-        for r in rows[:10]:
-            log(f"   M2={r[1]:.2f}us M16={r[2]:.2f}us {tuple(r[3])}")
-        # stagger and nontemporal effect on the best config
-        b = rows[0][3]
-        for alt in (b._replace(stag=1 - b.stag), b._replace(nt=1 - b.nt)):
-            ar = [r for r in rows if r[3] == alt]
+                rows.append((t2, t16, cfg, idx))
+        if not rows:
+            continue
+        lim16 = 1.03 * e_t[name][16]
+        ok = sorted([r for r in rows if r[1] <= lim16], key=lambda r: r[0])
+        by_score = sorted(rows, key=lambda r: r[0] + 0.25 * r[1])
+        log(f"[sweep h] {name} N={n} K={k}: {len(rows)} configs; e M2={e_t[name][2]:.2f} M16={e_t[name][16]:.2f}; "
+            f"{len(ok)} within M16 <= {lim16:.2f}")
+        log("   fastest M2 within the M16 limit:")
+        for r in ok[:6]:
+            log(f"   M2={r[0]:.2f}us M16={r[1]:.2f}us {tuple(r[2])}")
+        log("   best score M2 + 0.25*M16:")
+        for r in by_score[:4]:
+            log(f"   M2={r[0]:.2f}us M16={r[1]:.2f}us {tuple(r[2])}")
+        log("   fastest M16:")
+        for r in sorted(rows, key=lambda r: r[1])[:3]:
+            log(f"   M2={r[0]:.2f}us M16={r[1]:.2f}us {tuple(r[2])}")
+        cands = ok if ok else by_score
+        bcfg = cands[0][2]
+        for alt in (bcfg._replace(stag=1 - bcfg.stag),):
+            ar = [r for r in rows if r[2] == alt]
             if ar:
-                log(f"   variant {tuple(alt)}: M2={ar[0][1]:.2f} M16={ar[0][2]:.2f}")
-        for r in rows[:6]:
-            cfg = r[3]
-            idx = {mb: lib.find(mb, cfg, nseg) for mb in hg.MBS}
-            op = lambda x, w, _n, c=cfg, ix=idx: hg.gemv(lib, x, w, None, c, ix[hg.mb_of(x.shape[0])])
+                log(f"   stagger flipped {tuple(alt)}: M2={ar[0][0]:.2f} M16={ar[0][1]:.2f}")
+        for r in cands[:6]:
+            op = lambda x, w, _n, c=r[2], ix=r[3]: hg.gemv(lib, x, w, None, c, ix[hg.mb_of(x.shape[0])])
             v = invariant(op, ws, xs, name, k, reps=10)
             if v == "ok":
-                h_cfg[(n, k)] = (cfg, idx)
+                h_cfg[(n, k)] = (r[2], r[3])
                 break
-            log(f"   {tuple(cfg)} rejected: {v}")
+            log(f"   {tuple(r[2])} rejected: {v}")
     log(f"sweep h took {time.time() - t0:.0f}s")
 
     def h_pure(x, w, name):
@@ -281,9 +290,8 @@ def main_v3():
         if (n, k) not in h_cfg:
             use_hip[(n, k)] = False
             continue
-        se = res["e"]["shape"][(name, 2)] + 0.25 * res["e"]["shape"][(name, 16)]
-        sh = res["h_all"]["shape"][(name, 2)] + 0.25 * res["h_all"]["shape"][(name, 16)]
-        use_hip[(n, k)] = sh < se
+        use_hip[(n, k)] = (res["h_all"]["shape"][(name, 2)] < res["e"]["shape"][(name, 2)]
+                           and res["h_all"]["shape"][(name, 16)] <= 1.03 * res["e"]["shape"][(name, 16)])
     log("h uses HIP for:", {NAME_OF[nk][0]: v for nk, v in use_hip.items()})
 
     def h_op(x, w, name):
@@ -315,18 +323,17 @@ def main_v3():
         hd[name] = max((ops["h"](xs[(m, k)], w, name).float() - ops["e"](xs[(m, k)], w, name).float()).abs().max().item()
                        for m in (1, 2, 16))
     log("[check] h vs e max|diff| per shape (M=1,2,16):", {k: round(v, 5) for k, v in hd.items()})
-    # bias path of h
+    # bias path of h: error vs the fp32 reference must not exceed e's
     for (n, k), (cfg, idx) in h_cfg.items():
         w = ws[NAME_OF[(n, k)][0]][0]
         b = (torch.randn(n, device=DEV) * 0.1).to(torch.bfloat16)
         for m in (1, 3, 16):
             x = xs[(m, k)]
-            y0 = hg.gemv(lib, x, w, None, cfg, idx[hg.mb_of(m)])
-            y1 = hg.gemv(lib, x, w, b, cfg, idx[hg.mb_of(m)])
-            ref = (y0.float() + b.float()).to(torch.bfloat16)
-            d = (y1.float() - ref.float()).abs().max().item()
-            if d > 0.02:
-                log(f"[check] h bias mismatch N={n} M={m}: {d}")
+            ref = x.float() @ w.float().t() + b.float()
+            eh = (hg.gemv(lib, x, w, b, cfg, idx[hg.mb_of(m)]).float() - ref).abs().max().item()
+            ee = (sk.skinny_gemm(x, w, b, tuned[NAME_OF[(n, k)][0]]).float() - ref).abs().max().item()
+            if eh > 1.01 * ee + 1e-6:
+                log(f"[check] h bias err above e: N={n} K={k} M={m}: h {eh:.4g} e {ee:.4g}")
     log("[check] h bias path done")
 
     # ---------------- step graphs

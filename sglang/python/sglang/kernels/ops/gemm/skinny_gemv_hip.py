@@ -24,7 +24,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skinny_gemv_gfx90a.hip")
-SEG = 512  # K elements per segment (64 lanes x 8 bf16)
 MBS = (1, 2, 4, 8, 16)
 
 
@@ -33,7 +32,14 @@ class GemvConfig(NamedTuple):
     kparts: int  # P: waves splitting K for one row group
     groups: int  # G: row groups per workgroup
     nt: int = 1  # nontemporal weight loads
+    lpr: int = 64  # lanes per row: 8, 16 or 64
     stag: int = 1  # K-start rotation per workgroup (0 = off)
+
+    def nseg(self, k: int) -> int:
+        return k // (self.lpr * 8)
+
+    def takes(self, k: int, nseg: int) -> bool:
+        return k == nseg * self.lpr * 8
 
 
 def _cache_dir() -> str:
@@ -58,26 +64,27 @@ class GemvLib:
         vp, ci = ctypes.c_void_p, ctypes.c_int
         lib.skg_count.restype = ci
         lib.skg_entry.argtypes = [ci, ctypes.POINTER(ci)]
-        lib.skg_find.argtypes = [ci] * 6
+        lib.skg_find.argtypes = [ci] * 7
         lib.skg_launch.argtypes = [ci, vp, vp, vp, vp, ci, ci, ci, ci, ci, vp]
         lib.skg_read.argtypes = [vp, ctypes.c_longlong, vp, ci, vp]
         self.lib = lib
         self.path = path
         self.entries = []
-        buf = (ci * 6)()
+        buf = (ci * 7)()
         for i in range(lib.skg_count()):
             lib.skg_entry(i, buf)
             self.entries.append(tuple(buf))
 
-    def find(self, mb: int, cfg: GemvConfig, nseg: int) -> int:
-        return self.lib.skg_find(mb, cfg.rows, cfg.kparts, cfg.groups, cfg.nt, nseg)
+    def find(self, mb: int, cfg: GemvConfig, k: int) -> int:
+        return self.lib.skg_find(mb, cfg.rows, cfg.kparts, cfg.groups, cfg.nt, cfg.nseg(k), cfg.lpr)
 
-    def configs(self, nseg: int):
-        seen = []
-        for mb, r, p, g, nt, ns in self.entries:
-            if ns == nseg and mb == 1:
-                seen.append(GemvConfig(r, p, g, nt))
-        return seen
+    def configs(self, k: int) -> list[GemvConfig]:
+        """Configs built for weights with K columns."""
+        return [
+            GemvConfig(r, p, g, nt, lpr)
+            for mb, r, p, g, nt, ns, lpr in self.entries
+            if mb == 1 and ns * lpr * 8 == k
+        ]
 
 
 def build(defines: tuple[str, ...] = ("-DSKG_SWEEP",)) -> GemvLib:
@@ -118,11 +125,11 @@ def mb_of(m: int) -> int:
 def gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor],
          cfg: GemvConfig, idx: Optional[int] = None) -> torch.Tensor:
     """y = x @ w.T + bias with x [M <= 16, K] (unit inner stride, 16-byte aligned rows) and
-    contiguous w [N, K], K a multiple of 512."""
+    contiguous w [N, K], K = nseg * lpr * 8 for a built config."""
     M, K = x.shape
     N = w.shape[0]
     if idx is None:
-        idx = lib.find(mb_of(M), cfg, K // SEG)
+        idx = lib.find(mb_of(M), cfg, K)
     y = torch.empty((M, N), dtype=x.dtype, device=x.device)
     rc = lib.lib.skg_launch(
         idx, x.data_ptr(), w.data_ptr(), bias.data_ptr() if bias is not None else None,
