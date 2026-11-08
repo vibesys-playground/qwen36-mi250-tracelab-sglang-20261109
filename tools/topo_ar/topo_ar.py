@@ -161,8 +161,94 @@ def worker(rank, world):
     dist.destroy_process_group()
 
 
+PYNCCL_SETS = [
+    ("pair01", [[0, 1]]),
+    ("pair02", [[0, 2]]),
+    ("pair04", [[0, 4]]),
+    ("4pairs_concurrent", [[0, 1], [2, 3], [4, 5], [6, 7]]),
+    ("quad0123", [[0, 1, 2, 3]]),
+    ("2quads_concurrent", [[0, 1, 2, 3], [4, 5, 6, 7]]),
+    ("all8", [list(range(8))]),
+]
+PYNCCL_SIZES_KB = [8, 16, 32, 64, 2304]
+
+
+def pynccl_worker(rank, world):
+    """Graph-mode all-reduce through SGLang's PyNcclCommunicator, the path SGLang's HIP-graph
+    decode uses when custom all-reduce is off. torch.distributed is gloo-only here, so no
+    ProcessGroupNCCL watchdog exists to poll events during capture."""
+    torch.cuda.set_device(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world,
+                            init_method="tcp://127.0.0.1:29592")
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    all_pgs = [[dist.new_group(g, backend="gloo") for g in groups] for _, groups in PYNCCL_SETS]
+    for (name, groups), pgs in zip(PYNCCL_SETS, all_pgs):
+        mine = [pg for g, pg in zip(groups, pgs) if rank in g]
+        comm = PyNcclCommunicator(mine[0], device=rank) if mine else None
+        for kb in PYNCCL_SIZES_KB:
+            dist.barrier()
+            val = None
+            if comm is not None:
+                try:
+                    n = kb * 1024 // 2
+                    x = torch.ones(n, dtype=torch.bfloat16, device="cuda")
+                    ops = GRAPH_OPS if kb <= 64 else 20
+                    s = torch.cuda.Stream()
+                    with comm.change_state(enable=True):
+                        with torch.cuda.stream(s):
+                            for _ in range(10):
+                                comm.all_reduce(x)
+                        s.synchronize()
+                        eager_iters = 300 if kb <= 64 else 50
+                        dist.barrier(group=mine[0])
+                        t0 = time.perf_counter()
+                        with torch.cuda.stream(s):
+                            for _ in range(eager_iters):
+                                comm.all_reduce(x)
+                        s.synchronize()
+                        eager_us = (time.perf_counter() - t0) / eager_iters * 1e6
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, stream=s):
+                            for _ in range(ops):
+                                comm.all_reduce(x)
+                    torch.cuda.synchronize()
+                    g.replay()
+                    torch.cuda.synchronize()
+                    dist.barrier(group=mine[0])
+                    t0 = time.perf_counter()
+                    for _ in range(GRAPH_REPLAYS):
+                        g.replay()
+                    torch.cuda.synchronize()
+                    graph_us = (time.perf_counter() - t0) / (GRAPH_REPLAYS * ops) * 1e6
+                    del g
+                    val = (eager_us, graph_us)
+                except Exception as e:  # noqa: BLE001
+                    val = f"ERR {type(e).__name__}: {e}"
+            gathered = [None] * world
+            dist.all_gather_object(gathered, val)
+            if rank == 0:
+                cols = []
+                for g in groups:
+                    vals = [gathered[r] for r in g]
+                    bad = [v for v in vals if isinstance(v, str)]
+                    if bad:
+                        cols.append(bad[0])
+                    else:
+                        cols.append(f"eager={max(v[0] for v in vals):.1f} "
+                                    f"graph={max(v[1] for v in vals):.1f}")
+                print(f"RESULT pynccl {name:20s} {kb:6d}KB us/op(max rank) per group: "
+                      + " | ".join(cols), flush=True)
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 def main():
     world = torch.cuda.device_count()
+    if os.environ.get("TOPO_AR_MODE") == "pynccl":
+        print("devices:", world, "mode: pynccl", flush=True)
+        mp.spawn(pynccl_worker, args=(world,), nprocs=world, join=True)
+        return
     print("devices:", world, flush=True)
     if world < 8:
         topology()
