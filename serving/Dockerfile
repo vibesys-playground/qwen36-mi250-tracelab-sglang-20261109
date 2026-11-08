@@ -22,16 +22,24 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 3 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y \
  && rustc --version && cargo --version
 
-COPY sglang /sgl-workspace/sglang
-WORKDIR /sgl-workspace/sglang
-
 # Compile sgl-kernel for MI250 (gfx90a). The build has no GPU, so setup_rocm.py cannot probe the
 # architecture and would otherwise default to gfx942, whose code objects do not load on gfx90a.
+# The kernel tree is self-contained and copied alone first, so a change elsewhere in sglang/
+# reuses this cached layer.
 ENV AMDGPU_TARGET=gfx90a
+COPY sglang/python/sglang/kernels/aot /sgl-workspace/sglang/python/sglang/kernels/aot
+WORKDIR /sgl-workspace/sglang
 RUN cd python/sglang/kernels/aot \
  && rm -f pyproject.toml \
  && mv pyproject_rocm.toml pyproject.toml \
  && python setup_rocm.py install
+
+# The rest of the tree. Copying it restores the kernel tree's original pyproject files, so the
+# kernel step's rename is repeated to leave the same tree as a single copy would.
+COPY sglang /sgl-workspace/sglang
+RUN cd python/sglang/kernels/aot \
+ && rm -f pyproject.toml \
+ && mv pyproject_rocm.toml pyproject.toml
 
 # Install the sglang Python package with its ROCm extras, keeping the base's ROCm torch.
 RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt \
