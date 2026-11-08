@@ -19,8 +19,10 @@ fi
 # MI250 (gfx90a) adaptations, none of which changes the model's math:
 # - The HIP default attention backend is aiter, which the image does not install and which
 #   targets gfx942/gfx950; Triton attention runs on gfx90a. GDN layers already use Triton.
-# - Custom all-reduce is tuned for gfx942's all-to-all XGMI; MI250's 8 GCDs are not one hop
-#   apart, so every collective goes through RCCL.
+# - Custom all-reduce stays on (SGLang's default). Each TP=2 group is the two GCDs of one
+#   package, which amdsmi reports as XGMI one hop apart, so SGLang's one-shot P2P kernel serves
+#   decode and prefill all-reduces in place of RCCL (aiter is absent; SGLang's own kernel runs).
+#   Both ranks sum in rank order 0,1 in fp32, so they get bitwise identical results.
 # - The chat default is non-thinking (per-request chat_template_kwargs still override it).
 # - Usage reports cached prompt tokens, which the replay's prefix-cache accounting reads.
 # Parallel layout: four TP=2 replicas, one per MI250 card. DP rank r takes HIP devices 2r and
@@ -33,6 +35,5 @@ exec python3 -m sglang.launch_server "$@" \
   --dp-size 4 \
   --load-balance-method prefix_affinity \
   --attention-backend triton \
-  --disable-custom-all-reduce \
   --enable-cache-report \
   --default-chat-template-kwargs '{"enable_thinking": false}'

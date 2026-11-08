@@ -163,6 +163,11 @@ DINLINE void start_sync(
 #ifdef USE_ROCM
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
   if (threadIdx.x < ngpus) {
+#if defined(__gfx90a__)
+    // gfx90a L2 is not coherent with peer GCDs, so the input the previous kernel left dirty in L2
+    // must be written back (buffer_wbl2) before peers read it; without it MI250 peers read stale data.
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+#endif
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
     __scoped_atomic_store_n(
@@ -171,6 +176,9 @@ DINLINE void start_sync(
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) <
            flag)
       ;
+#if defined(__gfx90a__)
+    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
+#endif
   }
   __syncthreads();
   // use one thread to update flag
