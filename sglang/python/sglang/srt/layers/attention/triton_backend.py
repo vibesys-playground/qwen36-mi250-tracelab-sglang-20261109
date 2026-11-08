@@ -362,6 +362,23 @@ class TritonAttnBackend(AttentionBackend):
         self.enable_deterministic = (
             get_exec().deterministic.enable_deterministic_inference
         )
+        # Target-verify attention through the unified 1-stage extend kernel. The
+        # 2-stage kernel sums a verify row's softmax over the cached prefix and
+        # then over the verify block, so the same token at the same position gets
+        # differently rounded logits depending on where its verify block started,
+        # i.e. on how many draft tokens the previous step accepted. The unified
+        # kernel walks prefix and verify keys as one sequence in fixed BLOCK_N
+        # tiles from position 0, so a row's result depends only on its position
+        # and the committed tokens: greedy outputs no longer depend on the drafts,
+        # which keeps temperature-0 requests repeatable with speculative decoding.
+        # On by default on HIP (gfx95 uses its split-KV verify kernels instead).
+        self.use_unified_verify = (
+            not self.enable_deterministic
+            and get_bool_env_var(
+                "SGLANG_TRITON_UNIFIED_VERIFY", "true" if _is_hip else "false"
+            )
+            and not (is_gfx95_supported() and self.topk == 1)
+        )
 
         if self.enable_deterministic:
             # Fixed split tile size for batch invariance
@@ -1857,8 +1874,13 @@ class TritonAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
-        # Deterministic mode: use unified 1-stage kernel
-        if self.enable_deterministic:
+        # Deterministic mode: use unified 1-stage kernel. Target verify uses it
+        # too when use_unified_verify is set (see __init__).
+        if self.enable_deterministic or (
+            self.use_unified_verify
+            and forward_batch.forward_mode.is_target_verify()
+            and score_mod is None
+        ):
             return self._forward_extend_unified(
                 q,
                 o,
