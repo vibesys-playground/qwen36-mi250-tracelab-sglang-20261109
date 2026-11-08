@@ -2641,6 +2641,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
             )
+            # A prefix match stops one token short of the request's tokens, so a
+            # checkpoint at their very end can never serve a request that repeats
+            # them; keep the last prefill checkpoint one grid step earlier.
+            if (
+                mask
+                and mamba_track_seqlen_aligned == seq_end
+                and seq_end == len(req.full_untruncated_fill_ids)
+                and mamba_track_seqlen_aligned - checkpoint_grid > prefix_len
+            ):
+                mamba_track_seqlen_aligned -= checkpoint_grid
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
