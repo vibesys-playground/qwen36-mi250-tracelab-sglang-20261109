@@ -243,8 +243,283 @@ def pynccl_worker(rank, world):
     dist.destroy_process_group()
 
 
+# ---------------------------------------------------------------------------------------------
+# Plan 6 step 1: SGLang's HIP CustomAllreduce on same-card GCD pairs (the TP=2 groups the
+# 4xTP=2 layout uses), against PyNccl (RCCL) on the same groups, plus correctness.
+# ---------------------------------------------------------------------------------------------
+CA_SETS = [
+    ("pair01", [[0, 1]]),
+    ("4pairs_concurrent", [[0, 1], [2, 3], [4, 5], [6, 7]]),
+]
+CA_SIZES_KB = [8, 16, 32, 64, 2304]
+HIDDEN = 2048
+CORR_ITERS = 500
+
+
+def kernel_probe():
+    """Which load/store branch of custom_all_reduce_hip.cuh the gfx90a code object holds."""
+    import glob
+    import tempfile
+
+    import sgl_kernel
+
+    d = os.path.dirname(sgl_kernel.__file__)
+    sos = glob.glob(os.path.join(d, "**", "*.so"), recursive=True)
+    llvm = "/opt/rocm/llvm/bin"
+    tmp = tempfile.mkdtemp()
+    for so in sos:
+        fb = os.path.join(tmp, "fb.bin")
+        co = os.path.join(tmp, "k.co")
+        r = subprocess.run(f"objcopy --dump-section .hip_fatbin={fb} {so} {tmp}/x.so",
+                           shell=True, capture_output=True, text=True)
+        if r.returncode != 0:
+            continue
+        lst = subprocess.run(f"{llvm}/clang-offload-bundler --list --type=o --input={fb}",
+                             shell=True, capture_output=True, text=True).stdout.split()
+        tgt = [t for t in lst if "gfx90a" in t]
+        print("kernel_probe:", so, "targets:", lst, flush=True)
+        if not tgt:
+            continue
+        subprocess.run(f"{llvm}/clang-offload-bundler --unbundle --type=o --input={fb} "
+                       f"--targets={tgt[0]} --output={co}", shell=True)
+        dis = subprocess.run(f"{llvm}/llvm-objdump -d --mcpu=gfx90a {co}", shell=True,
+                             capture_output=True, text=True).stdout
+        # Print the body of the 2-rank bf16 1-stage kernel's memory instructions.
+        cur, shown = None, 0
+        for line in dis.splitlines():
+            if line.endswith(">:"):
+                cur = line
+                if "cross_device_reduce_1stage" in line and "Li2E" in line and "bfloat" in line \
+                        and shown == 0:
+                    print("kernel_probe symbol:", line, flush=True)
+                    shown = 1
+                elif shown == 1:
+                    shown = 2
+                continue
+            if shown == 1 and any(k in line for k in ("global_", "flat_", "buffer_wbl2",
+                                                      "buffer_invl2", "buffer_wbinvl1",
+                                                      "s_waitcnt vmcnt(0)")):
+                print("  ", line.strip()[:140], flush=True)
+        if shown == 0:
+            names = sorted({l for l in dis.splitlines() if "cross_device_reduce_1stage" in l
+                            and l.endswith(">:")})
+            print("kernel_probe: 1stage symbols:", names[:8], flush=True)
+
+
+def _seeded(rank, it, kb, n):
+    g = torch.Generator(device="cuda")
+    g.manual_seed(1_000_003 * rank + 7919 * it + kb)
+    return torch.randn(n, generator=g, device="cuda", dtype=torch.float32).to(torch.bfloat16)
+
+
+def _graph_time(fn_step, x0, pg, ops, comm_ctx):
+    """Capture `ops` chained calls of fn_step(x) -> x in one HIP graph, replay, us/op."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with comm_ctx():
+        with torch.cuda.graph(g, stream=s):
+            x = x0
+            for _ in range(ops):
+                x = fn_step(x)
+    torch.cuda.synchronize()
+    g.replay()
+    torch.cuda.synchronize()
+    dist.barrier(group=pg)
+    t0 = time.perf_counter()
+    for _ in range(GRAPH_REPLAYS):
+        g.replay()
+    torch.cuda.synchronize()
+    us = (time.perf_counter() - t0) / (GRAPH_REPLAYS * ops) * 1e6
+    del g
+    return us
+
+
+def ca_worker(rank, world):
+    import contextlib
+    import faulthandler
+    import hashlib
+
+    faulthandler.dump_traceback_later(1000, exit=True)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world,
+                            init_method="tcp://127.0.0.1:29593")
+    from sglang.srt.distributed.device_communicators import custom_all_reduce as car
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        gather_physical_device_ids,
+        is_full_nvlink,
+    )
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    if rank == 0:
+        print("CA class (dispatch):", car.dispatch_custom_allreduce(None, None),
+              "amd_deterministic:", car._use_amd_deterministic_impl(), flush=True)
+        try:
+            kernel_probe()
+        except Exception as e:  # noqa: BLE001
+            print("kernel_probe failed:", e, flush=True)
+    all_pgs = [[dist.new_group(g, backend="gloo") for g in groups] for _, groups in CA_SETS]
+    for (name, groups), pgs in zip(CA_SETS, all_pgs):
+        mine = [(g, pg) for g, pg in zip(groups, pgs) if rank in g]
+        dist.barrier()
+        g_ranks, pg = mine[0] if mine else (None, None)
+        ca = nccl = None
+        if pg is not None:
+            fn = is_full_nvlink(gather_physical_device_ids(pg, torch.device("cuda", rank)), 2)
+            ca = car.CustomAllreduce(group=pg, device=rank)
+            nccl = PyNcclCommunicator(pg, device=rank)
+            probe = torch.empty(4096, dtype=torch.bfloat16, device="cuda")
+            print(f"CAINIT {name} rank{rank} group={g_ranks} is_full_nvlink={fn} "
+                  f"disabled={ca.disabled} full_nvlink={getattr(ca, 'full_nvlink', None)} "
+                  f"max_size={getattr(ca, 'max_size', None)} "
+                  f"should_custom_ar(8KB)={ca.should_custom_ar(probe)} "
+                  f"should_custom_ar(2.3MB)={ca.should_custom_ar(torch.empty(1179648, dtype=torch.bfloat16, device='cuda'))}",
+                  flush=True)
+        for kb in CA_SIZES_KB:
+            dist.barrier()
+            val = None
+            if ca is not None and not ca.disabled:
+                try:
+                    val = ca_bench_one(rank, g_ranks, pg, ca, nccl, kb)
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
+                    val = f"ERR {type(e).__name__}: {e}"
+            gathered = [None] * world
+            dist.all_gather_object(gathered, val)
+            if rank == 0:
+                for gi, g in enumerate(groups):
+                    vals = [gathered[r] for r in g]
+                    bad = [v for v in vals if isinstance(v, str) or v is None]
+                    if bad:
+                        print(f"RESULT ca {name:18s} g{gi} {kb:5d}KB {bad[0]}", flush=True)
+                        continue
+                    t = {k: max(v[k] for v in vals) for k in vals[0] if k.endswith("_us")}
+                    c = vals[0]
+                    same = all(v["hashes"] == vals[0]["hashes"] for v in vals)
+                    print(f"RESULT ca {name:18s} g{gi} {kb:5d}KB "
+                          f"ca_eager={t['ca_eager_us']:.1f} ca_graph={t['ca_graph_us']:.1f} "
+                          f"nccl_graph={t['nccl_graph_us']:.1f} | in-context(after GEMM): "
+                          f"gemm={t['gemm_us']:.1f} +ca={t['ca_ctx_us'] - t['gemm_us']:.1f} "
+                          f"+nccl={t['nccl_ctx_us'] - t['gemm_us']:.1f} | "
+                          f"correct graph: bad={sum(v['g_bad'] for v in vals)} "
+                          f"maxerr_ulp={max(v['g_maxulp'] for v in vals):.2f} "
+                          f"exact={min(v['g_exact'] for v in vals):.5f} "
+                          f"eager: bad={sum(v['e_bad'] for v in vals)} "
+                          f"maxerr_ulp={max(v['e_maxulp'] for v in vals):.2f} "
+                          f"| ranks_bitwise_identical={same} iters={CORR_ITERS}",
+                          flush=True)
+    dist.barrier()
+    faulthandler.cancel_dump_traceback_later()
+    dist.destroy_process_group()
+
+
+def _ulp_err(out, ref32):
+    """Error of out in units of one BF16 ulp of the correctly rounded reference."""
+    refb = ref32.to(torch.bfloat16).float()
+    a = refb.abs().clamp_min(2.0 ** -126)
+    ulp = torch.exp2(torch.floor(torch.log2(a)) - 7)
+    e = (out.float() - ref32).abs() / ulp
+    exact = (out.float() == refb).float().mean().item()
+    return e.max().item(), int((e > 1.0).sum().item()), exact
+
+
+def ca_bench_one(rank, g_ranks, pg, ca, nccl, kb):
+    import contextlib
+
+    n = kb * 1024 // 2
+    rows = n // HIDDEN
+    res = {}
+    big = kb > 64
+    ops = 20 if big else GRAPH_OPS
+    # --- eager (unregistered path: copy into the IPC buffer, then the kernel) ---
+    x = torch.ones(n, dtype=torch.bfloat16, device="cuda")
+    for _ in range(10):
+        ca.custom_all_reduce(x)
+    torch.cuda.synchronize()
+    iters = 50 if big else 300
+    dist.barrier(group=pg)
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        ca.custom_all_reduce(x)
+    torch.cuda.synchronize()
+    res["ca_eager_us"] = (time.perf_counter() - t0) / iters * 1e6
+
+    def ca_ctx():
+        return ca.capture()
+
+    def nccl_ctx():
+        return nccl.change_state(enable=True)
+
+    # --- graph, back-to-back all-reduces on one buffer ---
+    res["ca_graph_us"] = _graph_time(lambda v: ca.custom_all_reduce(v), x, pg, ops, ca_ctx)
+
+    def nccl_step(v):
+        nccl.all_reduce(v)
+        return v
+    res["nccl_graph_us"] = _graph_time(nccl_step, x, pg, ops, nccl_ctx)
+
+    # --- graph, in context: x <- AR(x @ W), like a row-parallel projection feeding the
+    # next layer; the AR's input is written by the kernel just before it.
+    torch.manual_seed(rank)
+    W = (torch.randn(HIDDEN, HIDDEN, device="cuda") * 0.02).to(torch.bfloat16)
+    xm = torch.randn(rows, HIDDEN, device="cuda").to(torch.bfloat16)
+    res["gemm_us"] = _graph_time(lambda v: v @ W, xm, pg, ops, contextlib.nullcontext)
+    res["ca_ctx_us"] = _graph_time(lambda v: ca.custom_all_reduce(v @ W), xm, pg, ops, ca_ctx)
+
+    def nccl_ctx_step(v):
+        h = v @ W
+        nccl.all_reduce(h)
+        return h
+    res["nccl_ctx_us"] = _graph_time(nccl_ctx_step, xm, pg, ops, nccl_ctx)
+
+    # --- correctness, graph mode: static input refreshed every iteration with fresh random
+    # values; inside the graph a kernel writes h = 2*inp, then the AR reads h on both ranks.
+    inp = torch.zeros(n, dtype=torch.bfloat16, device="cuda")
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with ca.capture():
+        with torch.cuda.graph(g, stream=s):
+            out_g = ca.custom_all_reduce(inp * 2)
+    torch.cuda.synchronize()
+    wpos = (torch.arange(n, device="cuda", dtype=torch.int64) % 65521) + 1
+    hashes = []
+    g_bad = e_bad = 0
+    g_max = e_max = 0.0
+    g_exact = 1.0
+    for it in range(CORR_ITERS):
+        mine_in = _seeded(rank, it, kb, n)
+        ref = torch.zeros(n, dtype=torch.float32, device="cuda")
+        for r in g_ranks:  # fp32 sum of every rank's input, regenerated locally
+            ref += _seeded(r, it, kb, n).float()
+        inp.copy_(mine_in)
+        dist.barrier(group=pg)  # all ranks have new input before any rank reduces
+        g.replay()
+        torch.cuda.synchronize()
+        m, b, ex = _ulp_err(out_g, ref * 2)
+        g_max, g_bad, g_exact = max(g_max, m), g_bad + b, min(g_exact, ex)
+        hashes.append(int((out_g.view(torch.int16).to(torch.int64) * wpos).sum().item()))
+        # eager on the same inputs (the server's prefill/extend path)
+        out_e = ca.custom_all_reduce(mine_in)
+        torch.cuda.synchronize()
+        m, b, _ = _ulp_err(out_e, ref)
+        e_max, e_bad = max(e_max, m), e_bad + b
+        hashes.append(int((out_e.view(torch.int16).to(torch.int64) * wpos).sum().item()))
+    del g
+    res.update(g_bad=g_bad, g_maxulp=g_max, g_exact=g_exact, e_bad=e_bad, e_maxulp=e_max,
+               hashes=hashes)
+    return res
+
+
 def main():
     world = torch.cuda.device_count()
+    if os.environ.get("TOPO_AR_MODE") == "ca":
+        print("devices:", world, "mode: ca", flush=True)
+        mp.spawn(ca_worker, args=(world,), nprocs=world, join=True)
+        return
     if os.environ.get("TOPO_AR_MODE") == "pynccl":
         print("devices:", world, "mode: pynccl", flush=True)
         mp.spawn(pynccl_worker, args=(world,), nprocs=world, join=True)
