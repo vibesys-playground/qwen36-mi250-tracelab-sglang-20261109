@@ -1,4 +1,4 @@
-"""Plan 7 step 1 (SKINNY_BENCH=v1; the default runs plan 11's v2.py): replay one TP=2 decode step's dense GEMMs on one gfx90a GCD.
+"""Plan 7 step 1 (SKINNY_BENCH=v1; v2 = plan 11; the default runs plan 18's v3.py): replay one TP=2 decode step's dense GEMMs on one gfx90a GCD.
 
 Options: (a) F.linear (hipBLASLt), (c) Triton split-K skinny GEMM, (d) sgl tiny_gemm if it
 builds, (b) PyTorch TunableOp (run last: it changes F.linear globally). Every call has its own
@@ -276,8 +276,13 @@ def main():
 
 
 if __name__ == "__main__":
-    if os.environ.get("SKINNY_BENCH", "v2") == "v1":
+    which = os.environ.get("SKINNY_BENCH", "v3")
+    if which == "v1":
         sys.exit(main())
-    from v2 import main_v2
+    if which == "v2":
+        from v2 import main_v2
 
-    sys.exit(main_v2())
+        sys.exit(main_v2())
+    from v3 import main_v3
+
+    sys.exit(main_v3())

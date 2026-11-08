@@ -1,0 +1,134 @@
+"""Runtime build and ctypes binding of the gfx90a HIP skinny GEMV (skinny_gemv_gfx90a.hip).
+
+The .hip source is compiled once per (source, flags, arch) with hipcc into a cache directory
+(``SGLANG_SKINNY_GEMV_CACHE``, default ``$XDG_CACHE_HOME`` or ``/tmp``) under a file lock, so
+the ranks of one server share one build. Launches go on torch's current stream and can be
+captured in a HIP graph.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import fcntl
+import hashlib
+import logging
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from typing import NamedTuple, Optional
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skinny_gemv_gfx90a.hip")
+SEG = 512  # K elements per segment (64 lanes x 8 bf16)
+MBS = (1, 2, 4, 8, 16)
+
+
+class GemvConfig(NamedTuple):
+    rows: int  # R: rows of N per wave
+    kparts: int  # P: waves splitting K for one row group
+    groups: int  # G: row groups per workgroup
+    nt: int = 1  # nontemporal weight loads
+    stag: int = 1  # K-start rotation per workgroup (0 = off)
+
+
+def _cache_dir() -> str:
+    d = os.environ.get("SGLANG_SKINNY_GEMV_CACHE")
+    if not d:
+        base = os.environ.get("XDG_CACHE_HOME") or tempfile.gettempdir()
+        d = os.path.join(base, "sglang_skinny_gemv")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _hipcc() -> Optional[str]:
+    h = shutil.which("hipcc")
+    if h is None and os.path.exists("/opt/rocm/bin/hipcc"):
+        h = "/opt/rocm/bin/hipcc"
+    return h
+
+
+class GemvLib:
+    def __init__(self, path: str):
+        lib = ctypes.CDLL(path)
+        vp, ci = ctypes.c_void_p, ctypes.c_int
+        lib.skg_count.restype = ci
+        lib.skg_entry.argtypes = [ci, ctypes.POINTER(ci)]
+        lib.skg_find.argtypes = [ci] * 6
+        lib.skg_launch.argtypes = [ci, vp, vp, vp, vp, ci, ci, ci, ci, ci, vp]
+        lib.skg_read.argtypes = [vp, ctypes.c_longlong, vp, ci, vp]
+        self.lib = lib
+        self.path = path
+        self.entries = []
+        buf = (ci * 6)()
+        for i in range(lib.skg_count()):
+            lib.skg_entry(i, buf)
+            self.entries.append(tuple(buf))
+
+    def find(self, mb: int, cfg: GemvConfig, nseg: int) -> int:
+        return self.lib.skg_find(mb, cfg.rows, cfg.kparts, cfg.groups, cfg.nt, nseg)
+
+    def configs(self, nseg: int):
+        seen = []
+        for mb, r, p, g, nt, ns in self.entries:
+            if ns == nseg and mb == 1:
+                seen.append(GemvConfig(r, p, g, nt))
+        return seen
+
+
+def build(defines: tuple[str, ...] = ("-DSKG_SWEEP",)) -> GemvLib:
+    hipcc = _hipcc()
+    if hipcc is None:
+        raise RuntimeError("hipcc not found")
+    arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
+    flags = ["-O3", f"--offload-arch={arch}", "-ffp-contract=off", "-fPIC", "-shared", "-std=c++17",
+             "-Wno-unused-result", *defines]
+    h = hashlib.sha256(open(_SRC, "rb").read())
+    h.update(" ".join(flags).encode())
+    d = _cache_dir()
+    so = os.path.join(d, f"skinny_gemv_{h.hexdigest()[:16]}.so")
+    if not os.path.exists(so):
+        with open(os.path.join(d, "build.lock"), "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                if not os.path.exists(so):
+                    tmp = f"{so}.{os.getpid()}.tmp"
+                    t0 = time.time()
+                    r = subprocess.run([hipcc, *flags, "-o", tmp, _SRC], capture_output=True, text=True)
+                    if r.returncode != 0:
+                        raise RuntimeError(f"hipcc failed ({r.returncode}): {r.stderr[-3000:]}")
+                    os.replace(tmp, so)
+                    logger.info("skinny GEMV: built %s in %.1fs", so, time.time() - t0)
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
+    return GemvLib(so)
+
+
+def mb_of(m: int) -> int:
+    for mb in MBS:
+        if m <= mb:
+            return mb
+    raise ValueError(m)
+
+
+def gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor],
+         cfg: GemvConfig, idx: Optional[int] = None) -> torch.Tensor:
+    """y = x @ w.T + bias with x [M <= 16, K] (unit inner stride, 16-byte aligned rows) and
+    contiguous w [N, K], K a multiple of 512."""
+    M, K = x.shape
+    N = w.shape[0]
+    if idx is None:
+        idx = lib.find(mb_of(M), cfg, K // SEG)
+    y = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    rc = lib.lib.skg_launch(
+        idx, x.data_ptr(), w.data_ptr(), bias.data_ptr() if bias is not None else None,
+        y.data_ptr(), M, N, x.stride(0), N, cfg.stag,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    if rc != 0:
+        raise RuntimeError(f"skinny GEMV launch failed: hip error {rc} (idx {idx})")
+    return y
