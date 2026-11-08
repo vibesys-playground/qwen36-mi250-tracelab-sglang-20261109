@@ -428,6 +428,16 @@ class TritonAttnBackend(AttentionBackend):
             Lq=head_dim, Lv=head_dim
         )
         self.extend_attention_block_m = block_m
+        from sglang.kernels.ops.attention import extend_attention_gqa_split
+        from sglang.kernels.ops.attention.extend_attention import _is_gfx90a
+
+        # gfx90a, head_dim 256: GQA-packed split-KV extend for causal prefill.
+        self._gqa_split = extend_attention_gqa_split
+        self.use_gqa_split_extend = (
+            _is_gfx90a and head_dim == 256 and self.page_size == 1
+        )
+        # (forward_metadata it was planned for, plan or None); one plan serves all layers.
+        self._gqa_split_plan = None
         if dllm_fa4:
             from sglang.srt.dllm.attention import DllmFlashAttention
 
@@ -1961,6 +1971,25 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        if self.use_gqa_split_extend and self._gqa_split_extend(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            layer=layer,
+            forward_batch=forward_batch,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            causal=causal,
+            logit_cap=logits_soft_cap,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks,
+            score_mod=score_mod,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        ):
+            return o
+
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1990,6 +2019,93 @@ class TritonAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
+
+    def _gqa_split_plan_for(self, forward_batch: ForwardBatch, num_tokens: int):
+        cached = self._gqa_split_plan
+        if cached is not None and cached[0] is self.forward_metadata:
+            return cached[1]
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        bs = self.forward_metadata.qo_indptr.shape[0] - 1
+        plan = None
+        if (
+            prefix_lens is not None
+            and extend_lens is not None
+            and len(prefix_lens) == bs
+            and len(extend_lens) == bs
+            and sum(extend_lens) == num_tokens
+        ):
+            # Each sequence's split depends only on its own lengths, so its output
+            # does not depend on its batch-mates.
+            plan = self._gqa_split.plan(prefix_lens, extend_lens, device=self.device)
+        self._gqa_split_plan = (self.forward_metadata, plan)
+        return plan
+
+    def _gqa_split_extend(
+        self,
+        *,
+        q,
+        k,
+        v,
+        o,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        kv_indptr,
+        kv_indices,
+        causal: bool,
+        logit_cap: float,
+        sliding_window_size: int,
+        sinks,
+        score_mod,
+        k_descale: float,
+        v_descale: float,
+    ) -> bool:
+        """Run the gfx90a GQA-packed split-KV extend; False if the case is not covered."""
+        if self.dllm_attention is not None or k is None or v is None:
+            return False
+        k_buffer = self.kv_layers.read(layer.layer_id).key()
+        v_buffer = self.kv_layers.read(layer.layer_id).value()
+        if not self._gqa_split.can_handle(
+            q_head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            head_dim=layer.qk_head_dim,
+            v_head_dim=layer.v_head_dim,
+            is_causal=causal,
+            custom_mask=self.forward_metadata.custom_mask,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks,
+            logit_cap=logit_cap,
+            score_mod=score_mod,
+            xai_temperature_len=layer.xai_temperature_len,
+            page_size=self.page_size,
+            k_scale=k_descale,
+            v_scale=v_descale,
+            kv_dtype=k_buffer.dtype,
+        ):
+            return False
+        # The plan is built on the host; never inside a stream capture.
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if q3.dtype != k_buffer.dtype:
+            return False
+        plan = self._gqa_split_plan_for(forward_batch, q3.shape[0])
+        if plan is None:
+            return False
+        self._gqa_split.gqa_split_extend_fwd(
+            q3,
+            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim).contiguous(),
+            v.view(-1, layer.tp_v_head_num, layer.v_head_dim).contiguous(),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k_buffer,
+            v_buffer,
+            self.forward_metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            layer.scaling or layer.qk_head_dim**-0.5,
+            plan,
+        )
+        return True
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
         if self.dllm_attention is not None:

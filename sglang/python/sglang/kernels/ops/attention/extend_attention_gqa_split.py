@@ -228,10 +228,12 @@ def _gqa_split_merge(
 
 
 class GqaSplitConfig(NamedTuple):
-    bm_tok: int = 16  # tokens per tile; BLOCK_M = bm_tok * G
+    # Defaults measured on MI250 (gfx90a), 8 q heads per KV head, head_dim 256
+    # (tools/extend_attn/bench.py): 16-token tiles at 4 warps use AGPRs and are slower.
+    bm_tok: int = 8  # tokens per tile; BLOCK_M = bm_tok * G
     block_n: int = 64
-    num_warps: int = 8
-    waves_per_eu: int = 1
+    num_warps: int = 4
+    waves_per_eu: int = 2
     num_stages: int = 1
     split_d: int = 1
     target_wg: int = 220  # workgroups a sequence aims for (about 2 per CU on 110 CUs)
