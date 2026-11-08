@@ -380,6 +380,101 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
   end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+#ifdef USE_ROCM
+// One-stage all-reduce whose epilogue adds the residual and applies an RMSNorm, for the few-row
+// (decode) all-reduces that feed a layer norm. The reduction, its rank order (0, 1, ...) and both
+// barriers, including the gfx90a L2 fences in start_sync, are cross_device_reduce_1stage's. The
+// epilogue runs after end_sync and touches only this rank's out / residual_out.
+//
+// Rounding points are those of all_reduce -> sglang's Triton _gemma_fused_add_rmsnorm_kernel with
+// ROUND_SUM=True (the HIP GemmaRMSNorm path):
+//   x = T(sum over ranks in fp32)              (the all-reduce's output)
+//   s = T(f32(x) + f32(residual))               (residual_out; s = x without a residual)
+//   out = T(f32(s) * (1 / sqrt(mean(f32(s)^2) + eps)) * (weight_shift + f32(weight)))
+// Only the order of the sum of squares differs from Triton's tl.sum. Each row is reduced by
+// its own packs_per_row threads in a fixed tree (wave shuffles, then LDS partials in order), so
+// a row's result depends neither on the other rows nor on the number of rows.
+//
+// Layout: one thread per packed element (16 bytes); a 512-thread block holds 512 / packs_per_row
+// whole rows and block b owns rows [b * rows_per_block, (b + 1) * rows_per_block). That is the
+// same element-to-thread map as cross_device_reduce_1stage when size <= blocks * 512.
+template <typename T, int ngpus, bool kHasResidual>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_add_rmsnorm(
+    RankData* _dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ out,
+    T* __restrict__ residual_out,
+    const T* __restrict__ residual,
+    const T* __restrict__ weight,
+    float weight_shift,
+    float eps,
+    int rank,
+    int rows,
+    int packs_per_row) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int kPack = P::size;
+  constexpr int kWave = 64;
+  __shared__ float partials[512 / kWave];
+
+  auto dp = *_dp;
+  const int rows_per_block = blockDim.x / packs_per_row;
+  const int local_row = threadIdx.x / packs_per_row;
+  const int col = threadIdx.x - local_row * packs_per_row;
+  const int row = blockIdx.x * rows_per_block + local_row;
+  const bool active = row < rows;
+  const int idx = row * packs_per_row + col;
+
+  start_sync<ngpus>(sg, self_sg, rank);
+  P x;
+  if (active) x = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+  end_sync<ngpus, true>(sg, self_sg, rank);
+
+  // residual add, rounded to T as the residual stream stores it
+  A s;
+  float sq = 0.f;
+  if (active) {
+    P sx;
+    if constexpr (kHasResidual) {
+      P r = ((const P*)residual)[idx];
+#pragma unroll
+      for (int i = 0; i < kPack; i++) {
+        sx.data[i] = downcast_s<T>(upcast_s(x.data[i]) + upcast_s(r.data[i]));
+      }
+    } else {
+      sx = x;
+    }
+    if (residual_out != nullptr) ((P*)residual_out)[idx] = sx;
+#pragma unroll
+    for (int i = 0; i < kPack; i++) {
+      s.data[i] = upcast_s(sx.data[i]);
+      sq += s.data[i] * s.data[i];
+    }
+  }
+  // fixed-order row reduction: butterfly within each 64-lane wave, then the row's waves in order
+#pragma unroll
+  for (int off = kWave / 2; off > 0; off >>= 1) sq += __shfl_xor(sq, off, kWave);
+  const int wave = threadIdx.x / kWave;
+  if ((threadIdx.x & (kWave - 1)) == 0) partials[wave] = sq;
+  __syncthreads();
+  const int waves_per_row = packs_per_row / kWave;
+  const int first_wave = local_row * waves_per_row;
+  float tot = partials[first_wave];
+  for (int w = 1; w < waves_per_row; w++) tot += partials[first_wave + w];
+  if (!active) return;
+  const float var = tot / (float)(packs_per_row * kPack);
+  const float rstd = 1.0f / sqrtf(var + eps);
+  P wv = ((const P*)weight)[col];
+  P o;
+#pragma unroll
+  for (int i = 0; i < kPack; i++) {
+    o.data[i] = downcast_s<T>(s.data[i] * rstd * (weight_shift + upcast_s(wv.data[i])));
+  }
+  ((P*)out)[idx] = o;
+}
+#endif
+
 template <typename P>
 #ifdef USE_ROCM
 DINLINE P* get_tmp_buf(Signal* sg) {
@@ -679,6 +774,89 @@ class CustomAllreduce {
 #undef REDUCE_CASE
 #undef KL
 }
+
+#ifdef USE_ROCM
+// Returns false (and launches nothing) when the shape is outside the fused kernel's layout:
+// a row must be a whole number of 64-lane waves that divides the 512-thread block, and the
+// rows must fit in kMaxBlocks blocks. The caller then runs all-reduce + norm unfused.
+template <typename T>
+bool allreduce_add_rmsnorm(
+    hipStream_t stream,
+    T* input,
+    T* out,
+    T* residual_out,
+    const T* residual,
+    const T* weight,
+    float weight_shift,
+    float eps,
+    int rows,
+    int hidden) {
+  constexpr int d = packed_t<T>::P::size;
+  constexpr int threads = 512;
+  if (rows <= 0 || hidden % d != 0) return false;
+  const int packs_per_row = hidden / d;
+  if (packs_per_row % 64 != 0 || threads % packs_per_row != 0) return false;
+  const int rows_per_block = threads / packs_per_row;
+  const int blocks = (rows + rows_per_block - 1) / rows_per_block;
+  if (blocks > kMaxBlocks) return false;
+
+  RankData* ptrs;
+  hipStreamCaptureStatus status;
+  CUDACHECK(hipStreamIsCapturing(stream, &status));
+  if (status == hipStreamCaptureStatusActive) {
+    ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+    graph_unreg_buffers_.push_back(input);
+  } else {
+    auto it = buffers_.find(input);
+    if (it == buffers_.end())
+      throw std::runtime_error(
+          "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
+    ptrs = it->second;
+  }
+#define KL_NORM(ngpus, has_res)                                                    \
+  hipLaunchKernelGGL(                                                              \
+      (cross_device_reduce_1stage_add_rmsnorm<T, ngpus, has_res>),                 \
+      dim3(blocks),                                                                \
+      dim3(threads),                                                               \
+      0,                                                                           \
+      stream,                                                                      \
+      ptrs,                                                                        \
+      sg_,                                                                         \
+      self_sg_,                                                                    \
+      out,                                                                         \
+      residual_out,                                                                \
+      residual,                                                                    \
+      weight,                                                                      \
+      weight_shift,                                                                \
+      eps,                                                                         \
+      rank_,                                                                       \
+      rows,                                                                        \
+      packs_per_row);
+#define NORM_CASE(ngpus)       \
+  case ngpus: {                \
+    if (residual != nullptr) { \
+      KL_NORM(ngpus, true);    \
+    } else {                   \
+      KL_NORM(ngpus, false);   \
+    }                          \
+    break;                     \
+  }
+  switch (world_size_) {
+    NORM_CASE(2)
+    NORM_CASE(4)
+    NORM_CASE(6)
+    NORM_CASE(8)
+    default:
+      throw std::runtime_error(
+          "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+          "gpus = " +
+          std::to_string(world_size_));
+  }
+#undef NORM_CASE
+#undef KL_NORM
+  return true;
+}
+#endif
 
 ~CustomAllreduce() {
   for (auto [_, ptr] : ipc_handles_) {

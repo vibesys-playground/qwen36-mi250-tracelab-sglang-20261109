@@ -74,6 +74,16 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "()");
   m.impl("all_reduce_unreg", torch::kCUDA, &all_reduce_unreg);
 
+  m.def(
+      "all_reduce_add_rmsnorm_reg(int fa, Tensor inp, Tensor? residual, Tensor weight, "
+      "Tensor! out, Tensor! residual_out, float weight_shift, float eps) -> bool");
+  m.impl("all_reduce_add_rmsnorm_reg", torch::kCUDA, &all_reduce_add_rmsnorm_reg);
+
+  m.def(
+      "all_reduce_add_rmsnorm_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor? residual, "
+      "Tensor weight, Tensor! out, Tensor! residual_out, float weight_shift, float eps) -> bool");
+  m.impl("all_reduce_add_rmsnorm_unreg", torch::kCUDA, &all_reduce_add_rmsnorm_unreg);
+
   // Deterministic all-reduce for ROCm
   extern void deterministic_all_reduce_reg(int64_t _fa, torch::Tensor& inp, torch::Tensor& out);
   extern void deterministic_all_reduce_unreg(

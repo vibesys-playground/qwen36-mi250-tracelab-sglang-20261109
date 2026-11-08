@@ -62,6 +62,25 @@ fptr_t init_custom_ar(
     bool full_nvlink);
 void all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out);
+bool all_reduce_add_rmsnorm_reg(
+    fptr_t _fa,
+    torch::Tensor& inp,
+    const std::optional<torch::Tensor>& residual,
+    torch::Tensor& weight,
+    torch::Tensor& out,
+    torch::Tensor& residual_out,
+    double weight_shift,
+    double eps);
+bool all_reduce_add_rmsnorm_unreg(
+    fptr_t _fa,
+    torch::Tensor& inp,
+    torch::Tensor& reg_buffer,
+    const std::optional<torch::Tensor>& residual,
+    torch::Tensor& weight,
+    torch::Tensor& out,
+    torch::Tensor& residual_out,
+    double weight_shift,
+    double eps);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(
