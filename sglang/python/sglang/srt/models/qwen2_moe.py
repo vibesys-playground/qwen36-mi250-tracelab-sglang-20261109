@@ -31,6 +31,7 @@ from sglang.kernels.ops.elementwise.elementwise import (
     fused_gate_sigmoid_mul,
     fused_gate_sigmoid_mul_add,
 )
+from sglang.kernels.ops.moe import hip_decode_moe_block
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.distributed import (
     get_pp_indices,
@@ -441,6 +442,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
+        # Weights for the one-launch HIP decode MoE block, resolved at the first decode
+        # call (after weight loading); None keeps the per-op path.
+        self._hip_decode_mk_args: Optional[tuple] = None
+        self._hip_decode_mk_resolved = not (
+            _is_hip and envs.SGLANG_HIP_DECODE_MEGAKERNEL.get()
+        )
 
     def get_moe_weights(self):
         return [
@@ -723,6 +730,55 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
+    def _forward_hip_decode_megakernel(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self._hip_decode_mk_resolved:
+            self._hip_decode_mk_resolved = True
+            self._hip_decode_mk_args = self._hip_decode_megakernel_weights()
+        if self._hip_decode_mk_args is None or not hidden_states.is_contiguous():
+            return None
+        return hip_decode_moe_block.decode_moe_block(
+            hidden_states, *self._hip_decode_mk_args
+        )
+
+    def _hip_decode_megakernel_weights(self) -> Optional[tuple]:
+        """(router, shared gate_up, shared gate, shared down, w13, w2) when this block is the
+        BF16 softmax-top-8 shape the kernel implements, else None."""
+        if (
+            self.enable_shared_expert_fusion
+            or self.shared_expert is None
+            or self.is_nextn
+            or self._use_mega_moe
+            or not get_moe_a2a_backend().is_none()
+            or not isinstance(self.shared_expert_gate, torch.nn.Linear)
+            or not isinstance(self.shared_expert.act_fn, SiluAndMul)
+            or not hip_decode_moe_block.platform_ok()
+        ):
+            return None
+        cfg = self.topk.topk_config
+        if (
+            cfg.top_k != hip_decode_moe_block.TOPK
+            or not cfg.renormalize
+            or cfg.use_grouped_topk
+            or cfg.correction_bias is not None
+            or cfg.custom_routing_function is not None
+            or cfg.scoring_func != "softmax"
+            or cfg.routed_scaling_factor not in (None, 1.0)
+            or self.experts.moe_runner_config.routed_scaling_factor not in (None, 1.0)
+            or self.experts.num_local_experts != self.num_experts
+        ):
+            return None
+        args = (
+            self.gate.weight,
+            self.shared_expert.gate_up_proj.weight,
+            self.shared_expert_gate.weight.view(-1),
+            self.shared_expert.down_proj.weight,
+            self.experts.w13_weight,
+            self.experts.w2_weight,
+        )
+        return args if hip_decode_moe_block.weights_ok(*args) else None
+
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
@@ -841,6 +897,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)
+
+        if (
+            not defer_finalize
+            and 1 <= num_tokens <= hip_decode_moe_block.MAX_M
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            out = self._forward_hip_decode_megakernel(hidden_states)
+            if out is not None:
+                if self.reduce_results:
+                    out = reduce_moe_output(out)
+                return out.view(num_tokens, hidden_dim)
 
         if (
             get_moe_a2a_backend().is_deepep()
