@@ -35,6 +35,9 @@
 #include <stdint.h>
 #include <torch/all.h>
 
+// Same rounding as the stage-0 bench (built with -ffp-contract=off); fma only where written.
+#pragma clang fp contract(off)
+
 namespace hip_decode_moe {
 
 #define DEVI __device__ __forceinline__
