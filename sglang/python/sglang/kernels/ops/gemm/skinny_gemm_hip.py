@@ -11,6 +11,10 @@ counter) sums them in a fixed order (split 0, 1, ...) inside the same kernel; no
 atomics, and the sum order does not depend on which block arrives last. The schedule (tile sizes, split count) is a function of (N, K) only and x is
 always padded to one 16-row tile, so a row's result does not depend on how many other
 rows share the call.
+
+For the shapes in ``_GEMV_TUNED`` a hand-written HIP MFMA GEMV (skinny_gemv_gfx90a.hip, built
+with hipcc at first use) replaces this kernel; it loads the weight straight into registers,
+pads x to 16 MFMA rows the same way and keeps a fixed K order, so it is batch-invariant too.
 """
 
 from __future__ import annotations
@@ -23,6 +27,9 @@ from typing import NamedTuple, Optional
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.gemm import skinny_gemv_hip as _gemv
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +324,57 @@ def applicable(
     )
 
 
+# HIP MFMA GEMV (skinny_gemv_gfx90a.hip) for the (N, K) where it beats this Triton kernel at
+# M = 2 with M = 16 within 3%; one kernel for every M of a shape. Measured on an MI250 GCD
+# (tools/skinny_gemm v3.main_q, j118), us at M = 2 / 16, Triton -> GEMV:
+_GEMV_TUNED: dict[tuple[int, int], tuple[str, _gemv.MfmaConfig]] = {
+    (2048, 2048): ("q", _gemv.MfmaConfig(1, 4, 1, 1)),  # 15.8/18.3 -> 13.5/18.0
+    (4608, 2048): ("q", _gemv.MfmaConfig(1, 4, 1, 1)),  # 30.6/32.0 -> 22.2/29.4
+    (512, 2048): ("q", _gemv.MfmaConfig(1, 16, 1, 1)),  # 8.3/8.8 -> 6.8/9.0
+    (2048, 256): ("q", _gemv.MfmaConfig(1, 4, 1, 0)),  # 5.9/5.9 -> 3.2/3.7
+}
+
+_gemv_lib: Optional[_gemv.GemvLib] = None
+_gemv_idx: dict[tuple[int, int], int] = {}
+_gemv_decided = False
+
+
+def _gemv_ready() -> bool:
+    """Builds (hipcc, cached on disk) and loads the GEMV library once per process, on the first
+    skinny call; any failure keeps the process on the Triton kernel, so the kernel used for a
+    weight never changes during a run."""
+    global _gemv_lib, _gemv_decided
+    if _gemv_decided:
+        return _gemv_lib is not None
+    _gemv_decided = True
+    if not _GEMV_TUNED or envs.SGLANG_ROCM_DISABLE_SKINNY_GEMV.get():
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        logger.warning("skinny GEMV: first use is inside graph capture; using the Triton kernel")
+        return False
+    try:
+        entries = [(fam, cfg, k) for (n, k), (fam, cfg) in _GEMV_TUNED.items()]
+        lib = _gemv.build(defines=_gemv.table_defines(entries))
+        idx = {}
+        dev = torch.cuda.current_device()
+        for (n, k), (fam, cfg) in _GEMV_TUNED.items():
+            i = lib.q_find(cfg, k, fam)
+            if i < 0:
+                raise RuntimeError(f"no kernel for N={n} K={k} {fam} {cfg}")
+            idx[(n, k)] = i
+            # Load the code object on this device before any graph capture.
+            xw = torch.zeros((1, k), dtype=torch.bfloat16, device=dev)
+            _gemv.mfma_gemv(lib, xw, xw, None, cfg, i, fam)
+        torch.cuda.synchronize()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("skinny GEMV: HIP build or load failed, using the Triton kernel: %s", e)
+        return False
+    _gemv_idx.update(idx)
+    _gemv_lib = lib
+    logger.info("skinny GEMV: HIP MFMA kernels for %s", sorted(_GEMV_TUNED))
+    return True
+
+
 def skinny_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
@@ -324,5 +382,12 @@ def skinny_linear(
     x2 = x.reshape(-1, k)
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
-    y = skinny_gemm(x2, weight, bias, _config_for(n, k))
+    tuned = _GEMV_TUNED.get((n, k))
+    if tuned is not None and weight.data_ptr() % 16 == 0 and _gemv_ready():
+        if x2.data_ptr() % 16 != 0 or x2.stride(0) % 8 != 0:
+            x2 = x2.clone(memory_format=torch.contiguous_format)
+        fam, cfg = tuned
+        y = _gemv.mfma_gemv(_gemv_lib, x2, weight, bias, cfg, _gemv_idx[(n, k)], fam)
+    else:
+        y = skinny_gemm(x2, weight, bias, _config_for(n, k))
     return y.view(*x.shape[:-1], n)

@@ -201,3 +201,17 @@ def mfma_gemv(lib: GemvLib, x: torch.Tensor, w: torch.Tensor, bias: Optional[tor
     if rc != 0:
         raise RuntimeError(f"skinny MFMA GEMV launch failed: hip error {rc} (idx {idx})")
     return y
+
+
+def table_defines(entries: list[tuple[str, MfmaConfig, int]]) -> tuple[str, ...]:
+    """hipcc -D flags that instantiate only the given (family, config, K) kernels."""
+    q, f = [], []
+    for fam, cfg, k in entries:
+        args = f"{cfg.rows},{cfg.kparts},{cfg.groups},{cfg.hoist},{k // SEG_K[fam]},{cfg.dl}"
+        (q if fam == "q" else f).append(f"SKQ_C({args})" if fam == "q" else f"SKF_C({args})")
+    out = []
+    if q:
+        out.append("-DSKQ_TABLE=" + " ".join(sorted(set(q))))
+    if f:
+        out.append("-DSKF_TABLE=" + " ".join(sorted(set(f))))
+    return tuple(out)

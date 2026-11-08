@@ -1113,6 +1113,11 @@ class Envs:
     # Send BF16 linears with at most 16 rows on gfx90a back to hipBLASLt instead of the
     # Triton split-K skinny GEMM (kernels/ops/gemm/skinny_gemm_hip.py).
     SGLANG_ROCM_DISABLE_SKINNY_GEMM = EnvBool(False)
+    # Keep every gfx90a skinny GEMM on the Triton kernel instead of the HIP MFMA GEMV
+    # (kernels/ops/gemm/skinny_gemv_gfx90a.hip) for the shapes it is tuned for.
+    SGLANG_ROCM_DISABLE_SKINNY_GEMV = EnvBool(False)
+    # gfx90a: Qwen3.5 attention prologue (QK Gemma RMSNorm + mrope + gate) as one Triton kernel.
+    SGLANG_HIP_FUSED_QK_ROPE_GATE = EnvBool(True)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
