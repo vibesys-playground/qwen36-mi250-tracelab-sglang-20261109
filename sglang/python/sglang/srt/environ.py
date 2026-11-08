@@ -1110,6 +1110,9 @@ class Envs:
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    # Send BF16 linears with at most 16 rows on gfx90a back to hipBLASLt instead of the
+    # Triton split-K skinny GEMM (kernels/ops/gemm/skinny_gemm_hip.py).
+    SGLANG_ROCM_DISABLE_SKINNY_GEMM = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
