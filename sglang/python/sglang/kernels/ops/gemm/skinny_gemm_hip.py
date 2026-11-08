@@ -325,13 +325,19 @@ def applicable(
 
 
 # HIP MFMA GEMV (skinny_gemv_gfx90a.hip) for the (N, K) where it beats this Triton kernel at
-# M = 2 with M = 16 within 3%; one kernel for every M of a shape. Measured on an MI250 GCD
-# (tools/skinny_gemm v3.main_q, j118), us at M = 2 / 16, Triton -> GEMV:
-_GEMV_TUNED: dict[tuple[int, int], tuple[str, _gemv.MfmaConfig]] = {
-    (2048, 2048): ("q", _gemv.MfmaConfig(1, 4, 1, 1)),  # 15.8/18.3 -> 13.5/18.0
-    (4608, 2048): ("q", _gemv.MfmaConfig(1, 4, 1, 1)),  # 30.6/32.0 -> 22.2/29.4
-    (512, 2048): ("q", _gemv.MfmaConfig(1, 16, 1, 1)),  # 8.3/8.8 -> 6.8/9.0
-    (2048, 256): ("q", _gemv.MfmaConfig(1, 4, 1, 0)),  # 5.9/5.9 -> 3.2/3.7
+# M = 2 with M = 16 within 5%; one kernel for every M of a shape. "f2" is the 4x4x4 MFMA kernel
+# with a reduce-scatter, "q" the 16x16x16 one. Measured on an MI250 GCD (tools/skinny_gemm
+# v3.main_g, j130), us at M = 2 / 16, head (plan 18) -> this table:
+_GEMV_TUNED: dict[tuple[int, int], tuple[str, object]] = {
+    # Packed in_proj qkvz + ba; qkvz and ba alone share its P, so they get the packed bits.
+    (6176, 2048): ("f2", _gemv.F2Config(4, 16, 1)),  # 31.4/33.3 (Triton pair) -> 22.2/29.9
+    (6144, 2048): ("f2", _gemv.F2Config(4, 16, 1)),
+    (32, 2048): ("f2", _gemv.F2Config(4, 16, 1)),
+    (2048, 2048): ("f2", _gemv.F2Config(2, 8, 1)),  # 13.6/18.0 -> 9.4/15.9
+    (4608, 2048): ("f2", _gemv.F2Config(2, 8, 1)),  # 22.1/29.5 -> 17.2/29.2
+    (256, 2048): ("f2", _gemv.F2Config(1, 8, 1)),  # 6.4/6.9 -> 3.4/5.8
+    (512, 2048): ("f2", _gemv.F2Config(2, 8, 1)),  # 6.9/9.0 -> 4.5/6.8
+    (2048, 256): ("q", _gemv.MfmaConfig(1, 4, 1, 0)),  # f2 over +5% at M = 16
 }
 
 _gemv_lib: Optional[_gemv.GemvLib] = None
@@ -373,6 +379,11 @@ def _gemv_ready() -> bool:
     _gemv_lib = lib
     logger.info("skinny GEMV: HIP MFMA kernels for %s", sorted(_GEMV_TUNED))
     return True
+
+
+def gemv_active(n: int, k: int) -> bool:
+    """True when an [n, k] weight runs on the HIP GEMV in this process."""
+    return (n, k) in _GEMV_TUNED and _gemv_ready()
 
 
 def skinny_linear(

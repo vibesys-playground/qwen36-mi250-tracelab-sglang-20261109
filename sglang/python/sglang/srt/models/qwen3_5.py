@@ -194,7 +194,7 @@ _hip_packed_in_proj = (
     and get_bool_env_var("SGLANG_QWEN35_PACKED_IN_PROJ", "True")
 )
 if _hip_packed_in_proj:
-    from sglang.kernels.ops.gemm import skinny_gemm_packed_hip
+    from sglang.kernels.ops.gemm import skinny_gemm_hip, skinny_gemm_packed_hip
 _gdn_decode_fused_proj_conv = (
     _is_cuda or _is_hip_gfx90a
 ) and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
@@ -842,6 +842,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if _hip_packed_in_proj and self._fused_in_proj_weight is not None:
             split = self._fused_in_proj_qkvz_width
+            w = self._fused_in_proj_weight
+            # One HIP GEMV launch on the packed weight; its rows have the bits qkvz and ba get
+            # alone (same schedule, tools/skinny_gemm v3.main_g).
+            if skinny_gemm_hip.applicable(hidden_states, w, None) and skinny_gemm_hip.gemv_active(
+                *w.shape
+            ):
+                fused_out = skinny_gemm_hip.skinny_linear(hidden_states, w, None)
+                return fused_out[:, :split], fused_out[:, split:]
             if skinny_gemm_packed_hip.applicable(
                 hidden_states, self._fused_in_proj_weight, split
             ):
