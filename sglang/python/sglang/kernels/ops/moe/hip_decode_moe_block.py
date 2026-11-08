@@ -23,8 +23,11 @@ import torch
 logger = logging.getLogger(__name__)
 
 HIDDEN, NUM_EXPERTS, INTER, TOPK, MAX_M = 2048, 256, 256, 8, 8
-# Largest M the model dispatches here; the op takes up to MAX_M (tools/megakernel/moe_block_bench.py).
-DISPATCH_MAX_M = 8
+# Measured with tools/megakernel/moe_block_bench.py on gfx90a (us per block, graph replay):
+# M=1 40 vs 84 per-op, M=2 64 vs 107; M=4 as two M=2 launches 127 vs 147; M=8 254 vs 225.
+# So the model sends M <= 4 here, in launches of at most CHUNK_M rows (rows are independent).
+DISPATCH_MAX_M = 4
+CHUNK_M = 2
 _WS_BYTES = 65536
 _workspaces: dict[int, torch.Tensor] = {}
 _grids: dict[int, int] = {}
@@ -98,7 +101,8 @@ def decode_moe_block(
     grid: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     """MoE block output for ``x`` [M <= 8, 2048] (before the TP all-reduce), or None if the
-    kernel cannot run here (the caller then takes the per-op path)."""
+    kernel cannot run here (the caller then takes the per-op path). Rows go in launches of
+    CHUNK_M; each row's result is the same for any chunking, M or grid."""
     global _logged
     prep = _prepare(x.device)
     if prep is None:
@@ -106,16 +110,27 @@ def decode_moe_block(
     ws, g = prep
     if out is None:
         out = torch.empty_like(x)
-    torch.ops.sgl_kernel.hip_decode_moe_block(
-        x, w_router, w_sgu, w_sgate, w_sdown, w13, w2, out, ws, grid or g
-    )
+    for r0 in range(0, x.shape[0], CHUNK_M):
+        torch.ops.sgl_kernel.hip_decode_moe_block(
+            x[r0 : r0 + CHUNK_M],
+            w_router,
+            w_sgu,
+            w_sgate,
+            w_sdown,
+            w13,
+            w2,
+            out[r0 : r0 + CHUNK_M],
+            ws,
+            grid or g,
+        )
     if not _logged:
         _logged = True
         logger.info(
-            "HIP decode MoE megakernel: on (one launch per MoE block, grid=%d, M<=%d); "
+            "HIP decode MoE megakernel: on (decode M<=%d, %d rows per launch, grid=%d); "
             "SGLANG_HIP_DECODE_MEGAKERNEL=0 disables",
+            DISPATCH_MAX_M,
+            CHUNK_M,
             grid or g,
-            MAX_M,
         )
     return out
 
