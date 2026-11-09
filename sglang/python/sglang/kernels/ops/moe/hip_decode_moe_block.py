@@ -40,6 +40,10 @@ F_TOPK, F_DSUM, F_STAMP, F_LDSB, F_B2, F_W2X = 1, 4, 8, 16, 32, 64
 # replay, M=1 / M=2: variant 0 at 1 WG/CU 39.4 / 62.8; DPP top-8 36.8 / 59.7; + DPP sums
 # 36.0 / 55.2; + LDS-staged phase B at 2 WG/CU (the default) 34.5 / 53.5. Two-task
 # iterations (32, 64) did not help. All bitwise repeatable, batch and grid invariant.
+# Plan 29, j181 (MI250 GCD 0, sibling GCD idle or replaying the same kernel, 8 or 40 layers):
+# the default is still best, 34.2-35.0 / 53.6-54.5 us, unchanged by the sibling or the 40-layer
+# footprint; in the TP=2 server (bs=2 trace) it is 54.4 us/layer at M=2 vs 58.9 at 1 WG/CU and
+# 70.2 for variant 0 at 1 WG/CU.
 DEFAULT_VARIANT = F_TOPK | F_DSUM | F_LDSB
 # Workgroups per CU in the grid, capped by what is co-resident for the variant and M.
 DEFAULT_WG_PER_CU = 2
