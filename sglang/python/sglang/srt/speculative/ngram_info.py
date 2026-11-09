@@ -46,9 +46,12 @@ class NgramVerifyInput(SpecInput):
             self.device = custom_mask.device
         elif new_seq_lens is not None:
             self.device = new_seq_lens.device
-        else:
+        elif draft_token is not None:
             # Decode-shaped verify sends no tree mask.
             self.device = draft_token.device
+        else:
+            # Graph-capture dummy without a mask buffer.
+            self.device = torch.device("cuda", torch.cuda.current_device())
 
     @property
     def max_tree_depth(self) -> int:

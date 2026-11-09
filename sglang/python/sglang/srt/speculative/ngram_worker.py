@@ -94,14 +94,6 @@ class NGRAMWorker(BaseSpecWorker):
         )
         self.max_batch_size = self.model_runner.max_running_requests
         self._init_preallocated_tensors()
-        if self.decode_verify:
-            backend = self.model_runner.attn_backend
-            full_attn = getattr(backend, "full_attn_backend", backend)
-            if not getattr(full_attn, "decode_verify", False):
-                raise RuntimeError(
-                    "SGLANG_NGRAM_DECODE_VERIFY needs the Triton attention backend "
-                    "with a non-translating KV pool and no DCP/MLA/sliding window"
-                )
 
     def __init__(
         self,
@@ -192,6 +184,15 @@ class NGRAMWorker(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
+        # The target's backends exist by now (they are built before this worker's).
+        if self.decode_verify:
+            backend = self.model_runner.attn_backend
+            full_attn = getattr(backend, "full_attn_backend", backend)
+            if not getattr(full_attn, "decode_verify", False):
+                raise RuntimeError(
+                    "SGLANG_NGRAM_DECODE_VERIFY needs the Triton attention backend "
+                    "with a non-translating KV pool and no DCP/MLA/sliding window"
+                )
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
             self.target_worker, supports_sharded_verify=False
         )

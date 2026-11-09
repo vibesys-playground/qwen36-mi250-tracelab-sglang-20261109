@@ -323,7 +323,9 @@ def dsv_num_kv_splits(
     ) and not backend.enable_deterministic:
         num_kv_splits[: bs * T].fill_(backend.max_kv_splits)
         return
-    assert backend.split_tile_size is None, "decode-shaped verify: split tiles unsupported"
+    assert not (backend.split_tile_size is not None and backend.enable_deterministic), (
+        "decode-shaped verify: deterministic split tiles unsupported"
+    )
     _dsv_num_kv_splits_kernel[(T,)](
         num_kv_splits,
         seq_lens,
