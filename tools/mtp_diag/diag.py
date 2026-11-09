@@ -317,7 +317,7 @@ VARIANTS = {
                               "SGLANG_SPEC_DEBUG_STAGE_TIMING": "1"}),
 }
 # Variants that only need a short run (repeats, replay rounds).
-SHORT = {"spec-uv-timing": (3, 100)}
+SHORT = {"spec-uv-timing": (3, 100), "spec-uv-corrupt": (None, 100)}
 
 
 async def main() -> int:
@@ -326,7 +326,7 @@ async def main() -> int:
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--replay-rounds", type=int, default=303)
-    parser.add_argument("--variants", default="nospec,spec-uv,spec-uv-corrupt,spec-uv-timing")
+    parser.add_argument("--variants", default="nospec,spec-uv,spec-uv-corrupt,spec-uv-timing,nospec#2")
     args = parser.parse_args()
     root = Path.cwd()
     logdir = Path(tempfile.mkdtemp(prefix="mtp-diag-"))
@@ -340,7 +340,8 @@ async def main() -> int:
     outputs, summary = {}, []
     t_job = time.time()
     for name in args.variants.split(","):
-        spec, env_extra = VARIANTS[name]
+        # "nospec#2" reruns a variant later in the job, with every kernel cache warm.
+        spec, env_extra = VARIANTS[name.split("#")[0]]
         log(f"\n===== variant {name} (t={time.time() - t_job:.0f}s) env={env_extra} =====")
         script = root / "serving/serve.sh" if spec else nospec_script
         logfile = logdir / f"diag-{name}.log"
@@ -363,7 +364,8 @@ async def main() -> int:
                 continue
             log(f"ready after {time.time() - t0:.0f}s")
             outputs[name] = {}
-            repeats, rounds = SHORT.get(name, (args.repeats, args.replay_rounds))
+            repeats, rounds = SHORT.get(name, (None, None))
+            repeats, rounds = repeats or args.repeats, rounds or args.replay_rounds
             diffs = await determinism(url, repeats, args.max_tokens, outputs[name])
             summary.append(f"{name}: determinism groups with >1 distinct output: {diffs} of {2 * len(DET_PROMPTS)} (n={repeats})")
             await replay(url, root, rounds)
