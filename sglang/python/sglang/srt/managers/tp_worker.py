@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.speculative.decode_verify import debug_step_timer
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
@@ -677,10 +678,11 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            with debug_step_timer(forward_batch):
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             if folded is not None:
                 from sglang.srt.model_executor.encoder_swa_replay import (

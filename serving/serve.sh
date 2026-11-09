@@ -34,6 +34,15 @@ fi
 # replica whose radix and recurrent-state cache holds its prefix; new sessions go to the
 # least-loaded replica.
 # Save recurrent state every 64 decode tokens (default 256) so later rounds' prefix hits cover more of the previous output.
+# Speculative decoding by prompt lookup (no draft model): each request drafts the 3 tokens that
+#   followed the latest earlier occurrence of its last 1-4 tokens in its own prompt and output
+#   (sglang/python/sglang/srt/speculative/decode_verify.py); nothing is shared between
+#   requests. The target verifies the 4 positions of every request in one graph-captured step
+#   shaped as a decode batch of 4 rows per request, and accepts only its own argmax, so the
+#   emitted tokens are the target's greedy tokens. 8 running requests per replica bounds the
+#   per-position GDN state scratch (the workload runs 8 sessions over 4 replicas).
+export SGLANG_NGRAM_PROMPT_LOOKUP=1
+export SGLANG_NGRAM_DECODE_VERIFY=1
 exec python3 -m sglang.launch_server "$@" \
   --tp-size 2 \
   --dp-size 4 \
@@ -43,4 +52,9 @@ exec python3 -m sglang.launch_server "$@" \
   --cuda-graph-max-bs-prefill 2816 \
   --enable-cache-report \
   --mamba-track-interval 64 \
-  --default-chat-template-kwargs '{"enable_thinking": false}'
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --speculative-algorithm NGRAM \
+  --speculative-num-draft-tokens "${SGLANG_NGRAM_DRAFT_TOKENS:-4}" \
+  --speculative-ngram-max-bfs-breadth 1 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs 8

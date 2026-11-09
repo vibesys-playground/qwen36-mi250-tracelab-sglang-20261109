@@ -42,9 +42,13 @@ class NgramVerifyInput(SpecInput):
         self.accept_tokens = accept_tokens
         self.accept_lens = accept_lens
 
-        self.device = (
-            custom_mask.device if custom_mask is not None else new_seq_lens.device
-        )
+        if custom_mask is not None:
+            self.device = custom_mask.device
+        elif new_seq_lens is not None:
+            self.device = new_seq_lens.device
+        else:
+            # Decode-shaped verify sends no tree mask.
+            self.device = draft_token.device
 
     @property
     def max_tree_depth(self) -> int:

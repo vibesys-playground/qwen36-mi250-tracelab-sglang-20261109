@@ -54,6 +54,11 @@ from sglang.srt.runtime_context import (
     get_schedule,
     mamba_cache_chunk_size,
 )
+from sglang.srt.speculative.decode_verify import (
+    dsv_gdn_conv,
+    dsv_gdn_recurrence,
+    dsv_group,
+)
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
@@ -870,6 +875,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
+        group = dsv_group(forward_batch)
+        if group:
+            return self._forward_decode_verify(layer, forward_batch, mixed_qkv, group)
+
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -1093,6 +1102,64 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         return (core_attn_out, z) if return_z else core_attn_out
+
+    def _forward_decode_verify(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv,
+        group: int,
+    ):
+        """Decode-shaped chain verify (decode_verify.py): the decode conv and recurrence
+        over each request's `group` rows, per-position states into the spec scratch."""
+        if not isinstance(mixed_qkv, tuple) or len(mixed_qkv) != 2:
+            raise RuntimeError(
+                "decode-shaped verify needs the fused GDN decode projection "
+                "(SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV)"
+            )
+        projected_qkvz, projected_ba = mixed_qkv
+        bs = projected_qkvz.shape[0] // group
+        layer_cache = self.state_layer_cache(layer.layer_id)
+        assert isinstance(layer_cache, MambaPool.SpeculativeState)
+        cache_indices = self.forward_metadata.mamba_cache_indices[:bs]
+        inter_indices = select_verify_intermediate_state_indices(
+            self.verify_intermediate_state_indices,
+            forward_batch.req_pool_indices,
+            cache_indices >= 0,
+            self.req_to_token_pool.size,
+        )[:bs]
+        mixed, z, b, a = dsv_gdn_conv(
+            projected_qkvz,
+            projected_ba,
+            layer_cache.conv[0],
+            layer.conv_weights,
+            layer.bias,
+            cache_indices,
+            layer_cache.intermediate_conv_window[0],
+            inter_indices,
+            T=group,
+            qkv_dim=layer.q_dim + layer.k_dim + layer.v_dim,
+            v_dim=layer.v_dim,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+            activation=layer.activation,
+        )
+        core_attn_out = dsv_gdn_recurrence(
+            mixed,
+            a,
+            b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            ssm_states=layer_cache.temporal,
+            cache_indices=cache_indices,
+            inter_ssm=layer_cache.intermediate_ssm,
+            inter_indices=inter_indices,
+            T=group,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+        )
+        return core_attn_out, z
 
     def _convolve_prefill(
         self,

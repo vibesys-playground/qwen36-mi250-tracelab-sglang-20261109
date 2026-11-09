@@ -25,6 +25,11 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from sglang.srt.speculative.decode_verify import (
+    decode_verify_enabled,
+    make_drafter,
+    prompt_lookup_enabled,
+)
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
@@ -89,6 +94,14 @@ class NGRAMWorker(BaseSpecWorker):
         )
         self.max_batch_size = self.model_runner.max_running_requests
         self._init_preallocated_tensors()
+        if self.decode_verify:
+            backend = self.model_runner.attn_backend
+            full_attn = getattr(backend, "full_attn_backend", backend)
+            if not getattr(full_attn, "decode_verify", False):
+                raise RuntimeError(
+                    "SGLANG_NGRAM_DECODE_VERIFY needs the Triton attention backend "
+                    "with a non-translating KV pool and no DCP/MLA/sliding window"
+                )
 
     def __init__(
         self,
@@ -117,6 +130,24 @@ class NGRAMWorker(BaseSpecWorker):
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
         self.grammar_tree_host: Optional[tuple] = None
+
+        # Per-request prompt lookup (decode_verify.py) replaces the shared trie:
+        # drafts read only the request's own token ids.
+        self.lookup_drafter = None
+        self.decode_verify = decode_verify_enabled()
+        if prompt_lookup_enabled():
+            assert self.topk <= 1, "prompt-lookup drafts are a chain (topk 1)"
+            self.lookup_drafter = make_drafter(
+                k=self.draft_token_num - 1,
+                vocab_size=self.model_runner.model_config.vocab_size,
+            )
+            self.ngram_corpus = None
+            logger.info(
+                "NGRAM drafts: per-request prompt lookup, k=%d, decode-shaped verify=%s",
+                self.draft_token_num - 1,
+                self.decode_verify,
+            )
+            return
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
@@ -155,7 +186,8 @@ class NGRAMWorker(BaseSpecWorker):
         return None
 
     def clear_cache_pool(self):
-        self.ngram_corpus.reset()
+        if self.ngram_corpus is not None:
+            self.ngram_corpus.reset()
         self._prev_decode_rids = set()
 
     def init_attention_backends(self):
@@ -289,6 +321,13 @@ class NGRAMWorker(BaseSpecWorker):
             self.prev_token_ids = []
             self.prev_accept_lens = [0] * bs
 
+        if self.lookup_drafter is not None:
+            pending_lists = [
+                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
+                for i in range(bs)
+            ]
+            return self.lookup_drafter.batch(batch.reqs, pending_lists)
+
         self.ngram_corpus.synchronize()
         batch_tokens = []
         total_lens = []
@@ -333,7 +372,8 @@ class NGRAMWorker(BaseSpecWorker):
         # Pre-sync: only needs seq_lens_cpu, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
         ones_masks = None
-        if USE_FULL_MASK and not _is_cpu:
+        use_full_mask = USE_FULL_MASK and not _is_cpu and not self.decode_verify
+        if use_full_mask:
             ones_masks = [
                 torch.ones(
                     (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
@@ -362,7 +402,10 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK and not _is_cpu:
+        if self.decode_verify:
+            # Decode-shaped verify attends causally per row; no tree mask is read.
+            tree_mask = None
+        elif use_full_mask:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -404,6 +447,8 @@ class NGRAMWorker(BaseSpecWorker):
         )
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
+        if self.ngram_corpus is None:
+            return
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         for req in batch.reqs:
@@ -557,7 +602,7 @@ class NGRAMWorker(BaseSpecWorker):
             # The last batch's entries persist while idle (bounded, small).
             cur_rids = {req.rid for req in batch.reqs}
             departed_rids = self._prev_decode_rids - cur_rids
-            if departed_rids:
+            if departed_rids and self.ngram_corpus is not None:
                 self.ngram_corpus.erase_match_state(list(departed_rids))
             self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
