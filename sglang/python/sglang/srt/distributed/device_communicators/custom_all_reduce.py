@@ -6,7 +6,7 @@ import ctypes
 import logging
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -360,64 +360,6 @@ class CustomAllreduce:
                     return torch.zeros_like(input)
         else:
             return self._all_reduce_impl(input, registered=False)
-
-    # The fused kernel keeps the 1-stage layout: at most kMaxBlocks (64) blocks of 512 threads,
-    # each holding whole rows; 32 rows is the decode range it was measured on (tools/ar_norm).
-    _ADD_RMSNORM_MAX_ROWS = 32
-
-    def custom_all_reduce_add_rmsnorm(
-        self,
-        input: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        weight: torch.Tensor,
-        eps: float,
-        weight_shift: float,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """All-reduce ``input`` [rows, hidden], add ``residual`` and apply RMSNorm with
-        ``weight_shift + weight`` in one HIP kernel. Returns (normed, residual_out), the same
-        bits as custom_all_reduce -> the Triton Gemma add+norm (sum of squares order aside),
-        or None when this call cannot take it (the caller then runs the unfused path)."""
-        if (
-            not _is_hip
-            or self.disabled
-            or self.use_amd_deterministic_impl
-            or not getattr(ops, "HAS_ALL_REDUCE_ADD_RMSNORM", False)
-            or input.dim() != 2
-            or not 0 < input.shape[0] <= self._ADD_RMSNORM_MAX_ROWS
-            or input.dtype not in (torch.bfloat16, torch.float16)
-            or weight.dtype != input.dtype
-            or not input.is_contiguous()
-            or not weight.is_contiguous()
-            or (residual is not None and not residual.is_contiguous())
-            or input.numel() * input.element_size() > self.max_size
-        ):
-            return None
-        hidden = input.shape[1]
-        packs = hidden * input.element_size() // 16
-        if hidden * input.element_size() % 16 or packs % 64 or 512 % packs:
-            return None
-        if self._IS_CAPTURING:
-            if not torch.cuda.is_current_stream_capturing() or self.tms_cudagraph:
-                # Warmup or a split op: keep today's unfused path.
-                return None
-            reg_buffer = None
-        else:
-            reg_buffer = self.buffer
-        out = torch.empty_like(input)
-        residual_out = torch.empty_like(input)
-        if not ops.all_reduce_add_rmsnorm(
-            self._ptr,
-            input,
-            reg_buffer,
-            residual,
-            weight,
-            out,
-            residual_out,
-            float(weight_shift),
-            float(eps),
-        ):
-            return None
-        return out, residual_out
 
     def close(self):
         if not self.disabled and self._ptr:

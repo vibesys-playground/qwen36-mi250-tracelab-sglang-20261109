@@ -90,28 +90,6 @@ elif _is_hip:
     ) -> None:
         _custom_ar.all_reduce_unreg(fa, inp, reg_buffer, out)
 
-    # Fused all-reduce + residual add + RMSNorm; absent from an sgl_kernel built before it.
-    HAS_ALL_REDUCE_ADD_RMSNORM = hasattr(_custom_ar, "all_reduce_add_rmsnorm_reg")
-
-    def all_reduce_add_rmsnorm(
-        fa: int,
-        inp: torch.Tensor,
-        reg_buffer: Optional[torch.Tensor],
-        residual: Optional[torch.Tensor],
-        weight: torch.Tensor,
-        out: torch.Tensor,
-        residual_out: torch.Tensor,
-        weight_shift: float,
-        eps: float,
-    ) -> bool:
-        if reg_buffer is None:
-            return _custom_ar.all_reduce_add_rmsnorm_reg(
-                fa, inp, residual, weight, out, residual_out, weight_shift, eps
-            )
-        return _custom_ar.all_reduce_add_rmsnorm_unreg(
-            fa, inp, reg_buffer, residual, weight, out, residual_out, weight_shift, eps
-        )
-
     def deterministic_all_reduce_reg(
         fa: int, inp: torch.Tensor, out: torch.Tensor
     ) -> None:

@@ -339,8 +339,9 @@ _GEMV_TUNED: dict[tuple[int, int], tuple[str, object]] = {
     (512, 2048): ("f2", _gemv.F2Config(2, 8, 1)),  # 6.9/9.0 -> 4.5/6.8
     (2048, 256): ("q", _gemv.MfmaConfig(1, 4, 1, 0)),  # f2 over +5% at M = 16
     # Qwen3.5/3.6 lm_head shard at TP=2 (logits_processor calls skinny_linear directly; the
-    # generic path stops at _MAX_N). PLACEHOLDER until tools/decode_boundary picks a config.
-    (124160, 2048): ("f2", _gemv.F2Config(4, 16, 1)),
+    # generic path stops at _MAX_N). hipBLASLt 541/575 us at M = 2/16; (2, 8, 1) is 357 at
+    # M = 2 but 637 at M = 16; this one is faster than hipBLASLt at every M (j161).
+    (124160, 2048): ("f2", _gemv.F2Config(4, 4, 1)),  # 376/472 us at M = 2/16
 }
 
 _gemv_lib: Optional[_gemv.GemvLib] = None
