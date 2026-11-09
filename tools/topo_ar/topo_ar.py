@@ -247,10 +247,17 @@ def pynccl_worker(rank, world):
 # Plan 6 step 1: SGLang's HIP CustomAllreduce on same-card GCD pairs (the TP=2 groups the
 # 4xTP=2 layout uses), against PyNccl (RCCL) on the same groups, plus correctness.
 # ---------------------------------------------------------------------------------------------
-CA_SETS = [
-    ("pair01", [[0, 1]]),
-    ("4pairs_concurrent", [[0, 1], [2, 3], [4, 5], [6, 7]]),
-]
+CA_SETS_ALL = {
+    "pair01": [[0, 1]],
+    "4pairs_concurrent": [[0, 1], [2, 3], [4, 5], [6, 7]],
+    # plan 26: the TP=4 and TP=8 groups
+    "quad0123": [[0, 1, 2, 3]],
+    "2quads_concurrent": [[0, 1, 2, 3], [4, 5, 6, 7]],
+    "all8": [list(range(8))],
+}
+# TOPO_AR_CA_SETS=name,name,... picks the sets (default: the two TP=2 sets of plan 6).
+CA_SETS = [(n, CA_SETS_ALL[n]) for n in
+           os.environ.get("TOPO_AR_CA_SETS", "pair01,4pairs_concurrent").split(",")]
 CA_SIZES_KB = [8, 16, 32, 64, 2304]
 HIDDEN = 2048
 CORR_ITERS = 500
@@ -333,13 +340,16 @@ def _graph_time(fn_step, x0, pg, ops, comm_ctx, warm=None):
     g.replay()
     torch.cuda.synchronize()
     dist.barrier(group=pg)
-    t0 = time.perf_counter()
+    # p50 over replays of the per-op time (each replay is `ops` chained calls).
+    per = []
     for _ in range(GRAPH_REPLAYS):
+        t0 = time.perf_counter()
         g.replay()
-    torch.cuda.synchronize()
-    us = (time.perf_counter() - t0) / (GRAPH_REPLAYS * ops) * 1e6
+        torch.cuda.synchronize()
+        per.append((time.perf_counter() - t0) / ops * 1e6)
     del g
-    return us
+    per.sort()
+    return per[len(per) // 2]
 
 
 def ca_worker(rank, world):
@@ -347,7 +357,7 @@ def ca_worker(rank, world):
     import faulthandler
     import hashlib
 
-    faulthandler.dump_traceback_later(1080, exit=True)
+    faulthandler.dump_traceback_later(int(os.environ.get("TOPO_AR_CA_TIMEOUT", "1080")), exit=True)
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", rank=rank, world_size=world,
                             init_method="tcp://127.0.0.1:29593")
@@ -394,7 +404,7 @@ def ca_sets_run(rank, world, vname, all_pgs, car, gather_physical_device_ids, is
         g_ranks, pg = mine[0] if mine else (None, None)
         ca = nccl = None
         if pg is not None:
-            fn = is_full_nvlink(gather_physical_device_ids(pg, torch.device("cuda", rank)), 2)
+            fn = is_full_nvlink(gather_physical_device_ids(pg, torch.device("cuda", rank)), len(g_ranks))
             ca = car.CustomAllreduce(group=pg, device=rank)
             nccl = PyNcclCommunicator(pg, device=rank)
             probe = torch.empty(4096, dtype=torch.bfloat16, device="cuda")
@@ -548,6 +558,8 @@ def main():
         # Build the fenced gfx90a variant once here; the workers then load the built module.
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         try:
+            if os.environ.get("TOPO_AR_NO_VARIANT") == "1":
+                raise RuntimeError("skipped (TOPO_AR_NO_VARIANT=1; the checkout's kernel is the fenced one)")
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import ca_variant
             t0 = time.time()
