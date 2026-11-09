@@ -427,7 +427,7 @@ class TritonAttnBackend(AttentionBackend):
             and not self.is_draft_runner
             and self.topk <= 1
             and self.num_draft_tokens is not None
-            and self.num_draft_tokens > 1
+            and self.num_draft_tokens >= 1
             and self.dcp_size == 1
             and not self.use_mla
             and (self.sliding_window_size is None or self.sliding_window_size <= 0)

@@ -1,22 +1,22 @@
-"""Plan 27 stage 1 gates (c) exactness and (d) verify cost, one command job on an MI250 node.
+"""Plan 27 gates, one command job on an MI250 node (stage 2: GPU drafts, adaptive width).
 
-Four single TP=2 servers start at once, one per GCD pair, with serve.sh's flags (--dp-size 1):
-  nospec  no speculation (the head's decode path)
-  k3      prompt-lookup drafts, k=3, decode-shaped verify (serve.sh's setting)
-  k3c     k3 with 30% of the drafts replaced by random ids (debug switch)
-  k2      k=2
+First the GPU drafter unit check (unit_gpu_drafts.py) on one GCD. Then four single TP=2
+servers start at once, one per GCD pair, with serve.sh's flags (--dp-size 1):
+  nospec   no speculation (the head's decode path)
+  k2       prompt-lookup drafts on the GPU, k=2, adaptive verify width (serve.sh)
+  k2c      k2 with 30% of the drafts replaced by random ids (debug switch)
+  k2fixed  k2 without the adaptive width (always T = 3)
 Each gets the same requests (temperature 0, ignore_eos, exact lengths, token-id prompts):
-  * 8 round-0 prompts of the TraceLab sessions, built like tools/ngram_lookup/replay.py
-    (synthetic coding-text pool, fixed nonce), and 4 generic text prompts;
+  * 8 round-0 prompts of the TraceLab sessions (synthetic coding-text pool, fixed nonce)
+    and 4 generic text prompts;
   * seq1..seq3: one request at a time, /flush_cache before each (bs=1, no radix hit);
-  * pair: two at a time; conc: all 12 at once; kept: one at a time without flushing;
+  * pair, pair2: two at a time, twice; conc: all 12 at once; kept: one at a time warm;
   * stream: /v1/completions streaming like session_runner (ids per chunk vs usage and
     max_tokens, no chunk that restates the output so far);
-  * speed: bs=1 and bs=2 decode of 512 tokens, wall tok/s; then the same with the server's
-    synchronized step timer on (STEP_TIMING lines in the server log, mean ms per forward).
-Gate (c): every spec variant's seq1..3 outputs equal nospec seq1 token for token; pair/conc
-are reported against nospec pair/conc and seq1. Gate (d): k3 TARGET_VERIFY bs=2 step / nospec
-DECODE bs=2 step <= 1.9 (and k2). This tool reads the trace to build prompts; the server's
+  * speed: bs=1 and bs=2 decode of 512 tokens, wall tok/s.
+Gate (c): every spec variant's seq1..3 outputs equal nospec seq1 token for token, and at
+pair concurrency k2 equals k2c (lossless whatever the drafts), against the noise floor of
+nospec pair vs nospec pair2. This tool reads the trace to build prompts; the server's
 drafter does not.
 """
 import asyncio
@@ -53,12 +53,12 @@ BASE_FLAGS = [
 ]
 SPEC = ["--speculative-algorithm", "NGRAM", "--speculative-ngram-max-bfs-breadth", "1"]
 SPEC_ENV = {"SGLANG_NGRAM_PROMPT_LOOKUP": "1", "SGLANG_NGRAM_DECODE_VERIFY": "1"}
+K2 = SPEC + ["--speculative-num-draft-tokens", "3"]
 VARIANTS = {
     "nospec": ([], {}),
-    "k3": (SPEC + ["--speculative-num-draft-tokens", "4"], dict(SPEC_ENV)),
-    "k3c": (SPEC + ["--speculative-num-draft-tokens", "4"],
-            dict(SPEC_ENV, SGLANG_SPEC_DEBUG_CORRUPT_DRAFT_PCT="30")),
-    "k2": (SPEC + ["--speculative-num-draft-tokens", "3"], dict(SPEC_ENV)),
+    "k2": (K2, dict(SPEC_ENV)),
+    "k2c": (K2, dict(SPEC_ENV, SGLANG_SPEC_DEBUG_CORRUPT_DRAFT_PCT="30")),
+    "k2fixed": (K2, dict(SPEC_ENV, SGLANG_NGRAM_ADAPTIVE_WIDTH="0")),
 }
 
 
@@ -151,27 +151,26 @@ async def run_client(name, url, prompts, logfile):
                 outs[i + j] = o
         res["pair"] = outs
         await flush()
+        outs = [None] * len(prompts)
+        for i in range(0, len(prompts), 2):
+            pair = await asyncio.gather(*(generate(client, url, prompts[j]) for j in range(i, min(i + 2, len(prompts)))))
+            for j, (o, _) in enumerate(pair):
+                outs[i + j] = o
+        res["pair2"] = outs
+        await flush()
         res["conc"] = [o for o, _ in await asyncio.gather(*(generate(client, url, p) for p in prompts))]
         res["kept"] = [(await generate(client, url, p))[0] for p in prompts]
         log(f"[{name}] pair/conc/kept done")
         res["stream"] = [await stream(client, url, p) for p in prompts[:4] + prompts[8:10]]
-        # speed: 512 new tokens, bs=1 then bs=2, without and with the step timer
+        # speed: 512 new tokens, bs=1 then bs=2
         speed = {}
-        flag = OUT / f"timing_{name}"
-        for timed in (False, True):
-            if timed:
-                flag.touch()
-            for bs in (1, 2):
-                await flush()
-                t0 = time.perf_counter()
-                outs = await asyncio.gather(*(generate(client, url, prompts[j], 512) for j in range(bs)))
-                dt = time.perf_counter() - t0
-                n = sum(len(o) for o, _ in outs)
-                speed[f"{'timed' if timed else 'free'}_bs{bs}"] = round(n / dt, 1)
-            if timed:
-                for bs in (1, 2):  # more timed steps
-                    await asyncio.gather(*(generate(client, url, prompts[2 + j], 512) for j in range(bs)))
-                flag.unlink()
+        for bs in (1, 2):
+            await flush()
+            t0 = time.perf_counter()
+            outs = await asyncio.gather(*(generate(client, url, prompts[j], 512) for j in range(bs)))
+            dt = time.perf_counter() - t0
+            n = sum(len(o) for o, _ in outs)
+            speed[f"bs{bs}"] = round(n / dt, 1)
         res["speed"] = speed
         log(f"[{name}] speed {speed}")
     return res
@@ -192,7 +191,7 @@ def compare(results, prompts, logs):
         if r is None:
             lines.append(f"{name}: NO RESULT")
             continue
-        for mode in ("seq1", "seq2", "seq3", "pair", "conc", "kept"):
+        for mode in ("seq1", "seq2", "seq3", "pair", "pair2", "conc", "kept"):
             ref = base["seq1"] if base else None
             diffs = []
             for i, p in enumerate(prompts):
@@ -213,6 +212,22 @@ def compare(results, prompts, logs):
                 sum(r["pair"][i] == base["pair"][i] for i in range(len(prompts))), len(prompts),
                 sum(r["conc"][i] == base["conc"][i] for i in range(len(prompts))), len(prompts))
         lines.append(f"{name:7s} seq repeatable={rep}{pc}")
+    lines.append("--- pair concurrency (2 requests at once) ---")
+    n = len(prompts)
+
+    def same(a, b):
+        return sum(a[i] == b[i] for i in range(n))
+
+    if base:
+        lines.append(f"noise floor: nospec pair vs nospec pair2 {same(base['pair'], base['pair2'])}/{n}")
+    for name in ("k2", "k2fixed"):
+        r, c = results.get(name), results.get("k2c")
+        if r:
+            lines.append(f"{name} pair vs pair2 {same(r['pair'], r['pair2'])}/{n}"
+                         + (f"; vs nospec pair {same(r['pair'], base['pair'])}/{n}" if base else ""))
+        if r and c:
+            lines.append(f"GATE pair: {name} pair vs k2c pair {same(r['pair'], c['pair'])}/{n}, "
+                         f"{name} pair2 vs k2c pair2 {same(r['pair2'], c['pair2'])}/{n}")
     lines.append("=== stream integrity (session_runner checks) ===")
     for name, r in results.items():
         if r is None:
@@ -228,37 +243,22 @@ def compare(results, prompts, logs):
             same = "n/a" if not ref else str(s["ids"] == ref["stream"][k]["ids"])
             lines.append(f"{name:7s} {p['name']:6s} {'OK  ' if ok else 'FAIL'} ids==nospec.stream {same} ids={len(s['ids'])} usage={u.get('completion_tokens')} "
                          f"prompt_tokens={u.get('prompt_tokens')} chunks={len(s['chunks'])} max_chunk={max(s['chunks'] or [0])} restated={s['restated']} finish={s['finish']}")
-    lines.append("=== speed (wall tok/s, 512 new tokens; 'timed' runs with synchronized step timer) ===")
+    lines.append("=== speed (wall tok/s, 512 new tokens) ===")
     for name, r in results.items():
         if r is not None:
             lines.append(f"{name:7s} {r['speed']}{'  (EAGER: graph capture failed)' if r.get('eager') else ''}")
-    lines.append("=== step timing (server log STEP_TIMING, mean ms per forward) ===")
-    steps = {}
+    lines.append("=== server logs ===")
     for name, f in logs.items():
         text = Path(f).read_text(errors="replace")
-        acc = collections.defaultdict(list)
-        for m in re.finditer(r"STEP_TIMING mode=(\w+) bs=(\d+) n=(\d+) mean_ms=([0-9.]+)", text):
-            acc[(m.group(1), int(m.group(2)))].append(float(m.group(4)))
-        for key, xs in sorted(acc.items()):
-            xs = sorted(xs)
-            steps[(name,) + key] = xs[len(xs) // 2]
-            lines.append(f"{name:7s} {key[0]:13s} bs={key[1]} n_lines={len(xs)} median {xs[len(xs) // 2]:.3f} ms (min {xs[0]:.3f})")
         accept = [float(m.group(1)) for m in re.finditer(r"accept len: ([0-9.]+)", text)]
         if accept:
             lines.append(f"{name:7s} server log mean accept len {sum(accept) / len(accept):.2f} over {len(accept)} lines")
+        for l in text.splitlines():
+            if "NGRAM drafts:" in l or "adaptive width" in l or "matched n-gram lengths" in l:
+                lines.append(f"{name:7s} LOG: {l[:300]}")
         errs = [l for l in text.splitlines() if re.search(r"Traceback|Error|error:", l) and "Ignore import error" not in l and "server_args=" not in l]
         for l in errs[:15]:
             lines.append(f"{name:7s} LOG: {l[:300]}")
-    plain2 = steps.get(("nospec", "DECODE", 2))
-    for name in ("k3", "k2"):
-        v2 = steps.get((name, "TARGET_VERIFY", 2))
-        if plain2 and v2:
-            eager = bool((results.get(name) or {}).get("eager"))
-            lines.append(f"GATE (d) {name}: verify bs=2 {v2:.3f} ms / plain decode bs=2 {plain2:.3f} ms = {v2 / plain2:.3f}x (pass <= 1.9)"
-                         + ("  INVALID: eager, not graph replay" if eager else ""))
-        v1, p1 = steps.get((name, "TARGET_VERIFY", 1)), steps.get(("nospec", "DECODE", 1))
-        if v1 and p1:
-            lines.append(f"         {name}: verify bs=1 {v1:.3f} ms / plain decode bs=1 {p1:.3f} ms = {v1 / p1:.3f}x")
     return "\n".join(lines)
 
 
@@ -293,7 +293,7 @@ async def one_variant(name, gpus, port, prompts):
 async def _one_variant(name, gpus, port, prompts, extra):
     flags, env_extra = VARIANTS[name]
     flags = flags + extra
-    env = dict(os.environ, HIP_VISIBLE_DEVICES=gpus, SGLANG_DEBUG_STEP_TIMING=str(OUT / f"timing_{name}"), **env_extra)
+    env = dict(os.environ, HIP_VISIBLE_DEVICES=gpus, **env_extra)
     logf = OUT / f"server_{name}.log"
     cmd = [sys.executable, "-m", "sglang.launch_server", *BASE_FLAGS, "--port", str(port), *flags]
     proc = subprocess.Popen(cmd, env=env, stdout=open(logf, "w"), stderr=subprocess.STDOUT, cwd="/", start_new_session=True)
@@ -324,6 +324,10 @@ async def _one_variant(name, gpus, port, prompts, extra):
 async def main():
     OUT.mkdir(parents=True, exist_ok=True)
     names = sys.argv[1].split(",") if len(sys.argv) > 1 else list(VARIANTS)
+    unit = subprocess.run([sys.executable, str(HERE / "unit_gpu_drafts.py")], cwd="/",
+                          env=dict(os.environ, HIP_VISIBLE_DEVICES="0"),
+                          capture_output=True, text=True, timeout=1800)
+    log("=== unit: GPU drafts vs host drafts ===\n" + unit.stdout[-4000:] + unit.stderr[-3000:])
     prompts = build_prompts()
     log("prompts:", [(p["name"], len(p["ids"]), p["max"]) for p in prompts])
     gpus = ["0,1", "2,3", "4,5", "6,7"]

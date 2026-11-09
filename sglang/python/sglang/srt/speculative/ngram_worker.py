@@ -18,6 +18,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import (
+    get_context,
     get_device,
     get_schedule,
     get_spec,
@@ -26,7 +27,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.decode_verify import (
+    GpuLookupDrafter,
+    adaptive_draft_enabled,
     decode_verify_enabled,
+    gpu_drafts_enabled,
     make_drafter,
     prompt_lookup_enabled,
 )
@@ -94,6 +98,15 @@ class NGRAMWorker(BaseSpecWorker):
         )
         self.max_batch_size = self.model_runner.max_running_requests
         self._init_preallocated_tensors()
+        if self.use_gpu_drafts:
+            req_to_token = self.req_to_token_pool.req_to_token
+            self.gpu_drafter = GpuLookupDrafter(
+                k_max=self.draft_token_num - 1,
+                num_slots=req_to_token.shape[0],
+                max_len=req_to_token.shape[1],
+                device=self.device,
+                vocab_size=self.model_runner.model_config.vocab_size,
+            )
 
     def __init__(
         self,
@@ -127,6 +140,19 @@ class NGRAMWorker(BaseSpecWorker):
         # drafts read only the request's own token ids.
         self.lookup_drafter = None
         self.decode_verify = decode_verify_enabled()
+        # GPU drafts (no host sync) and the adaptive verify width need the
+        # decode-shaped verify; see decode_verify.GpuLookupDrafter.
+        self.use_gpu_drafts = (
+            prompt_lookup_enabled() and self.decode_verify and gpu_drafts_enabled()
+        )
+        self.gpu_drafter = None
+        self.adaptive_width = (
+            self.use_gpu_drafts and adaptive_draft_enabled() and self.draft_token_num > 1
+        )
+        # verify width T -> (target attention backend, target graph runner)
+        self._width_states = {}
+        self._active_width = self.draft_token_num
+        self._chain_masks = {}
         if prompt_lookup_enabled():
             assert self.topk <= 1, "prompt-lookup drafts are a chain (topk 1)"
             self.lookup_drafter = make_drafter(
@@ -135,9 +161,12 @@ class NGRAMWorker(BaseSpecWorker):
             )
             self.ngram_corpus = None
             logger.info(
-                "NGRAM drafts: per-request prompt lookup, k=%d, decode-shaped verify=%s",
+                "NGRAM drafts: per-request prompt lookup, k=%d, decode-shaped verify=%s, "
+                "gpu drafts=%s, adaptive width=%s",
                 self.draft_token_num - 1,
                 self.decode_verify,
+                self.use_gpu_drafts,
+                self.adaptive_width,
             )
             return
 
@@ -354,12 +383,140 @@ class NGRAMWorker(BaseSpecWorker):
         )
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
+    def init_cuda_graphs(self):
+        super().init_cuda_graphs()
+        if self.adaptive_width:
+            self._build_width_one_state()
+
+    def _build_width_one_state(self):
+        """A target attention backend and verify graphs for T = 1 (the last token, no
+        drafts), which is a plain decode step under the decode-shaped verify."""
+        mr = self.model_runner
+        full = (mr.attn_backend, mr.decode_cuda_graph_runner)
+        self._width_states[self.draft_token_num] = full
+        ctx = get_context()
+        ctx.override("ngram_adaptive_width.capture", speculative_num_draft_tokens=1)
+        try:
+            backup_init = mr.init_new_workspace
+            try:
+                backend = mr._get_attention_backend(init_new_workspace=True)
+            finally:
+                mr.init_new_workspace = backup_init
+            mr.attn_backend = backend
+            runner = None
+            if full[1] is not None:
+                runner = mr._decode_cuda_graph_runner_cls()(
+                    mr,
+                    attn_backend=backend,
+                    speculative_num_steps=get_spec().speculative_num_steps,
+                    speculative_num_draft_tokens=1,
+                )
+        finally:
+            ctx.override(
+                "ngram_adaptive_width.restore",
+                speculative_num_draft_tokens=self.draft_token_num,
+            )
+            mr.attn_backend, mr.decode_cuda_graph_runner = full
+        self._width_states[1] = (backend, runner)
+        logger.info("NGRAM adaptive width: T=1 verify state built (graphs=%s)", runner is not None)
+
+    def _use_width(self, width: int) -> None:
+        if width == self._active_width:
+            return
+        mr = self.model_runner
+        mr.attn_backend, mr.decode_cuda_graph_runner = self._width_states[width]
+        self._active_width = width
+
+    def _gpu_drafts_usable(self, batch: ScheduleBatch) -> bool:
+        info = batch.spec_info
+        return (
+            self.gpu_drafter is not None
+            and batch.forward_mode.is_decode()
+            and not batch.has_grammar
+            and info is not None
+            and info.accept_tokens is not None
+            and info.accept_lens is not None
+        )
+
+    def _pick_width(self, batch: ScheduleBatch) -> int:
+        """Full width while any request's latest draft came from an n-gram match, else
+        T = 1. The match lengths are one step old, so deciding needs no sync."""
+        if 1 not in self._width_states:
+            return self.draft_token_num
+        if self.gpu_drafter.any_recent_match(batch.reqs):
+            return self.draft_token_num
+        return 1
+
+    def _chain_mask(self, bs: int, width: int) -> torch.Tensor:
+        key = (bs, width)
+        mask = self._chain_masks.get(key)
+        if mask is None:
+            one = np.tril(np.ones((width, width), dtype=bool)).reshape(-1)
+            mask = torch.from_numpy(np.tile(one, bs)).to(self.device)
+            self._chain_masks[key] = mask
+        return mask
+
+    def _prepare_gpu_verify(self, batch: ScheduleBatch, width: int) -> None:
+        """Verify inputs with drafts made on the GPU; no host sync on the last step."""
+        bs = len(batch.reqs)
+        n = bs * width
+        draft_tokens = self.draft_tokens[:n]
+        positions = self.positions[:n]
+        retrieve_index = self.retrieve_indexes.view(-1)[:n].view(bs, width)
+        retrieve_next_token = self.retrieve_next_token.view(-1)[:n].view(bs, width)
+        retrieve_next_sibling = self.retrieve_next_sibling.view(-1)[:n].view(bs, width)
+        self.gpu_drafter.draft(
+            reqs=batch.reqs,
+            req_pool_indices=batch.req_pool_indices,
+            slots_cpu=[req.kv.req_pool_idx for req in batch.reqs],
+            seq_lens=batch.seq_lens,
+            spec_info=batch.spec_info,
+            out=draft_tokens,
+            T_out=width,
+        )
+        self.grammar_tree_host = None
+        reconstruct_indices_from_tree_mask_func(
+            self._chain_mask(bs, width),
+            batch.seq_lens,
+            positions,  # mutable
+            retrieve_index,  # mutable
+            retrieve_next_token,  # mutable
+            retrieve_next_sibling,  # mutable
+            bs,
+            width,
+        )
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.input_ids = draft_tokens
+        batch.out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=batch.req_to_token_pool.req_to_token,
+            start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + width,
+            batch_size=bs,
+            draft_token_num=width,
+            device=self.device,
+        )
+        prepare_mamba_track_for_verify(batch)
+        batch.spec_info = NgramVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=None,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            draft_token_num=width,
+        )
+
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, width: int):
         # Decode-only: extend goes through the plain target forward, and an
         # IDLE batch must keep its forward_mode instead of being rewritten to
         # TARGET_VERIFY below (relevant once DP attention support lands).
         if not batch.forward_mode.is_decode():
             return
+        if self._gpu_drafts_usable(batch):
+            self._prepare_gpu_verify(batch, width)
+            return
+        assert width == self.draft_token_num
 
         bs = len(batch.reqs)
 
@@ -477,8 +634,14 @@ class NGRAMWorker(BaseSpecWorker):
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
 
+        width = self.draft_token_num
+        if self.adaptive_width and self._gpu_drafts_usable(batch):
+            width = self._pick_width(batch)
+        # Prefill always runs on the startup backend, whose graphs it captured.
+        self._use_width(width)
+
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
-        self._prepare_for_speculative_decoding(batch)
+        self._prepare_for_speculative_decoding(batch, width)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
 
         verify_input: NgramVerifyInput = batch.spec_info
@@ -561,7 +724,7 @@ class NGRAMWorker(BaseSpecWorker):
                 batch,
                 accept_lens,
                 accept_index,
-                self.draft_token_num,
+                width,
             )
             accept_tokens = predict[accept_index]
             if (
@@ -573,6 +736,11 @@ class NGRAMWorker(BaseSpecWorker):
                     accept_tokens,
                     accept_lens,
                 )
+            if width < self.draft_token_num:
+                # Rows keep the full width: filter/merge and result parsing use it.
+                padded = accept_tokens.new_zeros((bs, self.draft_token_num))
+                padded[:, :width] = accept_tokens.view(bs, width)
+                accept_tokens = padded
             accept_tokens = accept_tokens.flatten()
             next_token_ids = accept_tokens
 
@@ -605,6 +773,8 @@ class NGRAMWorker(BaseSpecWorker):
             departed_rids = self._prev_decode_rids - cur_rids
             if departed_rids and self.ngram_corpus is not None:
                 self.ngram_corpus.erase_match_state(list(departed_rids))
+            if departed_rids and self.gpu_drafter is not None:
+                self.gpu_drafter.forget(cur_rids)
             self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
 

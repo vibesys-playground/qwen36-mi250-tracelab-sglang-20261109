@@ -31,6 +31,7 @@ sees ``DECODE`` (:func:`decode_shaped_verify`).
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 from typing import Optional
@@ -68,7 +69,7 @@ def is_dsv_batch(forward_batch) -> bool:
     return (
         _DSV_ON
         and spec_info is not None
-        and getattr(spec_info, "draft_token_num", 0) > 1
+        and getattr(spec_info, "draft_token_num", 0) >= 1
         and getattr(forward_batch, "ragged_verify_layout", None) is None
     )
 
@@ -246,6 +247,201 @@ def make_drafter(k: int, vocab_size: int) -> PromptLookupDrafter:
         corrupt_p=corrupt,
         vocab_size=vocab_size,
     )
+
+
+def gpu_drafts_enabled() -> bool:
+    return get_bool_env_var("SGLANG_NGRAM_GPU_DRAFTS", "true")
+
+
+def adaptive_draft_enabled() -> bool:
+    return get_bool_env_var("SGLANG_NGRAM_ADAPTIVE_WIDTH", "true")
+
+
+@triton.jit
+def _lookup_draft_kernel(
+    hist,
+    hist_stride,
+    slots,
+    seq_lens,
+    acc_tok,
+    acc_len,
+    acc_stride,
+    drafts,
+    match_n,
+    window,
+    seed,
+    corrupt_threshold,
+    vocab_size,
+    T_OUT: tl.constexpr,
+    ACC_W: tl.constexpr,
+    MAX_N: tl.constexpr,
+    MIN_N: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One request per program: put the tokens accepted last step into the request's
+    history row, then draft as PromptLookupDrafter.draft does.
+
+    The context is the row's first L = seq_len + 1 tokens: seq_len committed KV entries
+    and the last accepted token, which sits at position seq_len. The accepted tokens are
+    the last acc_len of the context, so they are stored at [L - acc_len, L); storing them
+    again writes the same ids at the same positions."""
+    i = tl.program_id(0)
+    slot = tl.load(slots + i).to(tl.int64)
+    row = hist + slot * hist_stride
+    L = tl.load(seq_lens + i).to(tl.int64) + 1
+    a = tl.load(acc_len + i).to(tl.int64)
+    for j in tl.static_range(ACC_W):
+        if j < a:
+            tok = tl.load(acc_tok + i * acc_stride + j)
+            tl.store(row + (L - a + j), tok.to(tl.int32))
+    tl.debug_barrier()
+
+    last = tl.load(row + L - 1)
+    start = tl.maximum(L - window, 0)
+    found = L * 0 - 1
+    matched = found * 0
+    for nn in tl.static_range(MAX_N - MIN_N + 1):
+        n: tl.constexpr = MAX_N - nn
+        if found < 0:
+            if L - 1 >= n:
+                end = L - n  # candidate starts i in [start, end)
+                hi = end
+                while hi > start:
+                    lo = tl.maximum(hi - BLOCK, start)
+                    offs = lo + tl.arange(0, BLOCK)
+                    ok = offs < hi
+                    for j in tl.static_range(n):
+                        p = tl.load(row + (L - n + j))
+                        ok = ok & (tl.load(row + offs + j, mask=offs < hi, other=-1) == p)
+                    best = tl.max(tl.where(ok, offs, -1), axis=0)
+                    if best >= 0:
+                        found = best + n
+                        matched = matched * 0 + n
+                        hi = start  # stop
+                    else:
+                        hi = lo
+    out = drafts + i * T_OUT
+    tl.store(out, last.to(tl.int64))
+    period = tl.maximum(L - found, 1)
+    for j in tl.static_range(T_OUT - 1):
+        if found >= 0:
+            d = tl.load(row + found + (j % period)).to(tl.int64)
+        else:
+            d = last.to(tl.int64)
+        if corrupt_threshold > 0:
+            off = i * (T_OUT - 1) + j
+            r = tl.randint(seed, off).to(tl.int64)
+            if (r & 0xFFFF) < corrupt_threshold:
+                d = ((r >> 16) % vocab_size).to(tl.int64)
+        tl.store(out + 1 + j, d)
+    tl.store(match_n + i, matched.to(tl.int32))
+
+
+class GpuLookupDrafter:
+    """PromptLookupDrafter on the GPU, with no host sync.
+
+    Each request slot (req_pool_idx) has a history row of token ids. A request's own
+    committed ids (prompt, then processed outputs) are copied in when it first decodes in
+    that slot; after that, every decode step's kernel adds the tokens its previous step
+    accepted, read from the device (the batch's spec_info), and drafts from the row. The
+    drafts therefore depend only on the request's own ids, as on the host, without waiting
+    for the previous step's result. ``match_n`` (the matched n-gram length, 0 for none) is
+    copied to the host asynchronously for the adaptive draft length; a step's lengths are
+    read two draft calls later, when its result has been processed, so every TP rank
+    decides the same width."""
+
+    def __init__(self, *, k_max, num_slots, max_len, device, vocab_size):
+        self.k_max = k_max
+        self.window = get_int_env_var("SGLANG_NGRAM_LOOKUP_WINDOW", 8192)
+        self.max_n = get_int_env_var("SGLANG_NGRAM_LOOKUP_MAX_N", 4)
+        self.min_n = get_int_env_var("SGLANG_NGRAM_LOOKUP_MIN_N", 1)
+        corrupt = get_int_env_var("SGLANG_SPEC_DEBUG_CORRUPT_DRAFT_PCT", 0)
+        # DEBUG ONLY (never set when serving): replace this share of draft tokens with
+        # random ids, drawn from a counter-based generator, the same on every TP rank.
+        self.corrupt_threshold = int(corrupt * 65536 // 100)
+        self.vocab_size = vocab_size
+        self.device = device
+        self.hist = torch.zeros((num_slots, max_len + k_max + 2), dtype=torch.int32, device=device)
+        self.owner = [None] * num_slots
+        self.step = 0
+        self.match_n = torch.zeros((num_slots,), dtype=torch.int32, device=device)
+        self._host_match = collections.deque()  # (step, rids, pinned tensor, event)
+        self.last_match = {}  # rid -> matched n at its latest known step
+        self._match_hist = [0] * (self.max_n + 1)
+        self._polls = 0
+
+    def _upload(self, reqs, slots_cpu):
+        for req, slot in zip(reqs, slots_cpu):
+            if self.owner[slot] == req.rid:
+                continue
+            self.owner[slot] = req.rid
+            prompt = req.origin_input_ids_unpadded
+            out = req.output_ids
+            c = len(prompt) + len(out)
+            keep = min(c, self.window + self.max_n + 1)
+            ids = (list(prompt) + list(out))[c - keep :]
+            src = torch.tensor(ids, dtype=torch.int32).pin_memory()
+            self.hist[slot, c - keep : c].copy_(src, non_blocking=True)
+
+    def poll_matches(self):
+        """Fold in the match lengths of all draft calls but the latest (called before the
+        next draft). Those steps' results are processed already, so the wait returns at
+        once, and the set folded depends only on the call count, never on timing."""
+        while self._host_match and self._host_match[0][0] <= self.step - 1:
+            _, rids, host, ev = self._host_match.popleft()
+            ev.synchronize()
+            for rid, n in zip(rids, host.tolist()):
+                self.last_match[rid] = n
+                self._match_hist[min(n, len(self._match_hist) - 1)] += 1
+            self._polls += 1
+            if self._polls % 2000 == 0:
+                logger.info("NGRAM lookup matched n-gram lengths (0 = none): %s", self._match_hist)
+
+    def any_recent_match(self, reqs) -> bool:
+        """Whether any request's latest known draft came from an n-gram match (unknown
+        counts as a match)."""
+        self.poll_matches()
+        return any(self.last_match.get(r.rid, 1) > 0 for r in reqs)
+
+    def forget(self, live_rids):
+        for rid in list(self.last_match):
+            if rid not in live_rids:
+                del self.last_match[rid]
+
+    def draft(self, reqs, req_pool_indices, slots_cpu, seq_lens, spec_info, out, T_out):
+        """Fill out[: bs * T_out] with [last, d_1 .. d_{T_out-1}] per request."""
+        bs = len(reqs)
+        self._upload(reqs, slots_cpu)
+        acc_tok = spec_info.accept_tokens
+        acc_len = spec_info.accept_lens
+        acc_w = acc_tok.numel() // max(bs, 1)
+        self.step += 1
+        _lookup_draft_kernel[(bs,)](
+            self.hist,
+            self.hist.stride(0),
+            req_pool_indices,
+            seq_lens,
+            acc_tok,
+            acc_len,
+            acc_w,
+            out,
+            self.match_n,
+            self.window,
+            self.step,
+            self.corrupt_threshold,
+            max(self.vocab_size, 1),
+            T_OUT=T_out,
+            ACC_W=acc_w,
+            MAX_N=self.max_n,
+            MIN_N=self.min_n,
+            BLOCK=256,
+            num_warps=4,
+        )
+        host = torch.empty((bs,), dtype=torch.int32, pin_memory=True)
+        host.copy_(self.match_n[:bs], non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self._host_match.append((self.step, [r.rid for r in reqs], host, ev))
 
 
 # ----------------------------------------------------------------------------------------
@@ -723,46 +919,3 @@ def dsv_gdn_recurrence(
         num_stages=3,
     )
     return out.transpose(0, 1)
-
-
-# ----------------------------------------------------------------------------------------
-# DEBUG ONLY (SGLANG_DEBUG_STEP_TIMING=<path>, never set when serving): synchronized forward
-# time of decode/verify steps, measured while the file <path> exists.
-# ----------------------------------------------------------------------------------------
-
-import os as _os
-
-_STEP_TIMING_FLAG = _os.environ.get("SGLANG_DEBUG_STEP_TIMING", "")
-_step_acc: dict = {}
-
-
-@contextlib.contextmanager
-def debug_step_timer(forward_batch):
-    """Logs the mean synchronized model forward time per (mode, requests) every 50
-    forwards. The syncs remove CPU/GPU overlap; for comparing step costs only."""
-    if (
-        not _STEP_TIMING_FLAG
-        or not (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        )
-        or not _os.path.exists(_STEP_TIMING_FLAG)
-    ):
-        yield
-        return
-    import time
-
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    yield
-    torch.cuda.synchronize()
-    dt = time.perf_counter() - t0
-    key = (forward_batch.forward_mode.name, int(forward_batch.batch_size))
-    n, tot = _step_acc.get(key, (0, 0.0))
-    n, tot = n + 1, tot + dt
-    if n >= 50:
-        logger.warning(
-            "STEP_TIMING mode=%s bs=%d n=%d mean_ms=%.3f", key[0], key[1], n, 1000 * tot / n
-        )
-        n, tot = 0, 0.0
-    _step_acc[key] = (n, tot)
