@@ -24,6 +24,35 @@ if torch.version.hip is not None:
     ) -> None:
         torch.ops.sgl_kernel.all_reduce_unreg.default(fa, inp, reg_buffer, out)
 
+    def all_reduce_add_rmsnorm_reg(
+        fa: int,
+        inp: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        residual_out: torch.Tensor,
+        weight_shift: float,
+        eps: float,
+    ) -> bool:
+        return torch.ops.sgl_kernel.all_reduce_add_rmsnorm_reg.default(
+            fa, inp, residual, weight, out, residual_out, weight_shift, eps
+        )
+
+    def all_reduce_add_rmsnorm_unreg(
+        fa: int,
+        inp: torch.Tensor,
+        reg_buffer: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        residual_out: torch.Tensor,
+        weight_shift: float,
+        eps: float,
+    ) -> bool:
+        return torch.ops.sgl_kernel.all_reduce_add_rmsnorm_unreg.default(
+            fa, inp, reg_buffer, residual, weight, out, residual_out, weight_shift, eps
+        )
+
     def deterministic_all_reduce_reg(
         fa: int, inp: torch.Tensor, out: torch.Tensor
     ) -> None:
