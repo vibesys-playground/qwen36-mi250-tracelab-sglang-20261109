@@ -1,11 +1,16 @@
 """Plan 27 gates, one command job on an MI250 node (stage 2: GPU drafts, adaptive width).
 
-First the GPU drafter unit check (unit_gpu_drafts.py) on one GCD. Then four single TP=2
-servers start at once, one per GCD pair, with serve.sh's flags (--dp-size 1):
-  nospec   no speculation (the head's decode path)
+First the GPU drafter unit check (unit_gpu_drafts.py) on one GCD. Then single TP=2 servers,
+four at a time (one per GCD pair), with serve.sh's flags (--dp-size 1). Phase 1, the full
+exactness set, on the shipped config (overlap off, extra_buffer Mamba radix cache):
+  nospec   no speculation (the head's decode path, overlap on)
   k2       prompt-lookup drafts on the GPU, k=2, adaptive verify width (serve.sh)
   k2c      k2 with 30% of the drafts replaced by random ids (debug switch)
-  k2fixed  k2 without the adaptive width (always T = 3)
+  k2host   kill switch SGLANG_NGRAM_GPU_DRAFTS=0 (host drafts, fixed width)
+Phase 2 (seq1, pair, pair2, stream, replay):
+  k2fixed  kill switch SGLANG_NGRAM_ADAPTIVE_WIDTH=0 (always T = 3)
+  k2ovl    k2 with the overlap scheduler on (the way back)
+  nospec2  second nospec, the replay timing and pair noise floor
 Each gets the same requests (temperature 0, ignore_eos, exact lengths, token-id prompts):
   * 8 round-0 prompts of the TraceLab sessions (synthetic coding-text pool, fixed nonce)
     and 4 generic text prompts;
@@ -54,20 +59,21 @@ BASE_FLAGS = [
 SPEC = ["--speculative-algorithm", "NGRAM", "--speculative-ngram-max-bfs-breadth", "1"]
 SPEC_ENV = {"SGLANG_NGRAM_PROMPT_LOOKUP": "1", "SGLANG_NGRAM_DECODE_VERIFY": "1"}
 K2 = SPEC + ["--speculative-num-draft-tokens", "3"]
-NOOVL = ["--disable-overlap-schedule"]
+NOOVL = ["--disable-overlap-schedule", "--mamba-radix-cache-strategy", "extra_buffer"]
+SHIP = K2 + NOOVL
 VARIANTS = {
     "nospec": ([], {}),
-    "k2": (K2, dict(SPEC_ENV)),
-    "k2c": (K2, dict(SPEC_ENV, SGLANG_SPEC_DEBUG_CORRUPT_DRAFT_PCT="30")),
-    "k2fixed": (K2, dict(SPEC_ENV, SGLANG_NGRAM_ADAPTIVE_WIDTH="0")),
-    "k2_noovl": (K2 + NOOVL, dict(SPEC_ENV)),
-    "k2fixed_noovl": (K2 + NOOVL, dict(SPEC_ENV, SGLANG_NGRAM_ADAPTIVE_WIDTH="0")),
+    "k2": (SHIP, dict(SPEC_ENV)),
+    "k2c": (SHIP, dict(SPEC_ENV, SGLANG_SPEC_DEBUG_CORRUPT_DRAFT_PCT="30")),
+    "k2host": (SHIP, dict(SPEC_ENV, SGLANG_NGRAM_GPU_DRAFTS="0")),
+    "k2fixed": (SHIP, dict(SPEC_ENV, SGLANG_NGRAM_ADAPTIVE_WIDTH="0")),
+    "k2ovl": (K2, dict(SPEC_ENV)),
     "nospec2": ([], {}),
 }
-# Phase 1 is the exactness gate; phase 2 adds the overlap-off variants (exactness at
-# bs=1 and pair) and a second nospec as the replay timing noise floor.
-PHASES = [["nospec", "k2", "k2c", "k2fixed"], ["k2_noovl", "k2fixed_noovl", "nospec2"]]
-FULL = {"nospec", "k2", "k2c", "k2fixed"}
+# Phase 1 is the exactness gate on the shipped config; phase 2 covers the kill switch for
+# adaptive width, the overlap-on fallback and a second nospec as the noise floor.
+PHASES = [["nospec", "k2", "k2c", "k2host"], ["k2fixed", "k2ovl", "nospec2"]]
+FULL = set(PHASES[0])
 
 
 def log(*a):
@@ -235,7 +241,10 @@ def compare(results, prompts, logs):
 
     if base:
         lines.append(f"noise floor: nospec pair vs nospec pair2 {same(base['pair'], base['pair2'])}/{n}")
-    for name in ("k2", "k2fixed", "k2_noovl", "k2fixed_noovl"):
+        b2 = results.get("nospec2")
+        if b2:
+            lines.append(f"noise floor: nospec pair vs nospec2 pair {same(base['pair'], b2['pair'])}/{n}")
+    for name in ("k2", "k2host", "k2fixed", "k2ovl"):
         r, c = results.get(name), results.get("k2c")
         if r:
             lines.append(f"{name} pair vs pair2 {same(r['pair'], r['pair2'])}/{n}"
