@@ -23,7 +23,10 @@ import contextlib
 import importlib
 import json
 import math
+import os
+import subprocess
 import sys
+import time
 import traceback
 import types
 
@@ -32,7 +35,7 @@ import torch.nn.functional as F
 
 DEV = torch.device("cuda", 0)
 HID, NE, INTER, TOPK = 2048, 256, 256, 8
-NLAYERS = 8
+NLAYERS = int(os.environ.get("NLAYERS", "8"))
 MS = (1, 2, 3, 4, 5, 6, 7, 8)
 RES = {}
 
@@ -376,6 +379,204 @@ def variants_main():
     log("RESULT " + json.dumps(RES, default=str))
 
 
+# ------------------------------------------------------------------------------------ plan 29
+# MI250 transfer of the plan 23 tuning: the plan's variants at M = 1, 2 over NLAYERS_LIST layers
+# (8 as in j151; 40 = the server's footprint), alone and with the sibling GCD (device 1 of the
+# same package, a separate process) replaying the same variant over its own NL layers, as the
+# TP peer does in the server. Burst = best of 5 x 20 graph replays (as j151); sustained = mean
+# over ~1.5 s of back-to-back replays while rocm-smi samples clocks and power.
+P29_VARIANTS = [("base/1", 0, 1), ("topk+dsum/1", 5, 1), ("ldsb/1", 21, 1), ("ldsb/2", 21, 2),
+                ("ldsb+b2/2", 53, 2)]
+P29_STAMPED = ("ldsb/2+stamp", 29, 2)
+
+
+def _blocks(nl, seed):
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    return [make_block(gen) for _ in range(nl)], gen
+
+
+def _kern_fn(mk, ws, blocks, xs, outs, v, w):
+    def run():
+        for L, x, o in zip(blocks, xs, outs):
+            g = mk.max_grid(x.shape[0], v, 0, w)
+            torch.ops.sgl_kernel.hip_decode_moe_block(x, L["router"], L["sgu"], L["sgate"], L["sdown"], L["w13"],
+                                                      L["w2"], o, ws, g, v)
+    return run
+
+
+def sibling_main(nl, ctrl):
+    """Device-1 load: replays the graph named in ``ctrl`` ("v w M", or "idle") until "exit"."""
+    from sglang.kernels.ops.moe import hip_decode_moe_block as mk
+
+    assert mk.platform_ok()
+    mk._prepare(DEV)
+    ws = mk._workspaces[0]
+    blocks, gen = _blocks(nl, 999)
+    xs_by_m = {M: [bf(torch.randn(M, HID, device=DEV, generator=gen)) for _ in range(nl)] for M in (1, 2)}
+    outs_by_m = {M: [torch.empty_like(x) for x in xs] for M, xs in xs_by_m.items()}
+    torch.cuda.synchronize()
+    _write(ctrl + ".ack", "ready")
+    cur, g = None, None
+    while True:
+        try:
+            want = open(ctrl).read().strip()
+        except OSError:
+            want = "idle"
+        if want == "exit":
+            return 0
+        if not want:
+            continue
+        if want != cur:
+            g = None
+            if want != "idle":
+                v, w, M = (int(t) for t in want.split())
+                g = capture(_kern_fn(mk, ws, blocks, xs_by_m[M], outs_by_m[M], v, w))
+            cur = want
+            torch.cuda.synchronize()
+            _write(ctrl + ".ack", cur)
+        if g is None:
+            time.sleep(0.05)
+            continue
+        for _ in range(50):
+            g.replay()
+        torch.cuda.synchronize()
+
+
+def _write(path, text):
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def _sib_set(ctrl, want):
+    _write(ctrl, want)
+    t0 = time.time()
+    while time.time() - t0 < 600:
+        try:
+            if open(ctrl + ".ack").read().strip() == want:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    log("sibling did not ack", want)
+    return False
+
+
+def mi250_main():
+    props = torch.cuda.get_device_properties(0)
+    cu = props.multi_processor_count
+    log("device:", props.name, props.gcnArchName, "CUs", cu, "HIP_VISIBLE_DEVICES", os.environ.get("HIP_VISIBLE_DEVICES"))
+    from sglang.kernels.ops.moe import hip_decode_moe_block as mk
+
+    log("platform_ok", mk.platform_ok(), "default_config", mk.default_config())
+    mk._prepare(DEV)
+    ws = mk._workspaces[0]
+    views = mk.workspace_views(DEV)
+    nls = [int(t) for t in os.environ.get("NLAYERS_LIST", "8,40").split(",")]
+    out = {"sweep": [], "phases": {}, "bitwise": {}}
+    ctrl_dir = os.environ.get("P29_TMP", "/tmp/p29")
+    os.makedirs(ctrl_dir, exist_ok=True)
+    for nl in nls:
+        ctrl = f"{ctrl_dir}/sib_{nl}"
+        for f in (ctrl, ctrl + ".ack"):
+            with contextlib.suppress(OSError):
+                os.remove(f)
+        _write(ctrl, "idle")
+        env = dict(os.environ, HIP_VISIBLE_DEVICES="1")
+        sib = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--sibling", str(nl), ctrl], env=env)
+        blocks, gen = _blocks(nl, 4321)
+        xs_by_m = {M: [bf(torch.randn(M, HID, device=DEV, generator=gen)) for _ in range(nl)] for M in (1, 2)}
+        outs_by_m = {M: [torch.empty_like(x) for x in xs] for M, xs in xs_by_m.items()}
+        torch.cuda.synchronize()
+        log(f"NL={nl}: {torch.cuda.memory_allocated() / 1e9:.1f} GB on device 0")
+        if nl == nls[0]:  # every variant bitwise equal to variant 0 at 1 WG/CU (M=1,2, grid-invariance)
+            for name, v, w in P29_VARIANTS + [P29_STAMPED]:
+                eq = True
+                for M in (1, 2):
+                    for i in range(min(nl, 4)):
+                        a = torch.empty_like(xs_by_m[M][i])
+                        b = torch.empty_like(a)
+                        _kern_fn(mk, ws, blocks[i:i + 1], xs_by_m[M][i:i + 1], [a], 0, 1)()
+                        _kern_fn(mk, ws, blocks[i:i + 1], xs_by_m[M][i:i + 1], [b], v, w)()
+                        torch.cuda.synchronize()
+                        eq &= bool(torch.equal(a, b))
+                out["bitwise"][name] = eq
+                log("bitwise_eq_variant0", name, eq, "sync_err", int(views["sync"][128].item()))
+        t_wait = time.time()
+        while not os.path.exists(ctrl + ".ack") and time.time() - t_wait < 900:
+            time.sleep(0.5)
+        for rep in range(2):
+            for sibling in (0, 1):
+                for M in (1, 2):
+                    for name, v, w in P29_VARIANTS:
+                        _sib_set(ctrl, f"{v} {w} {M}" if sibling else "idle")
+                        g = capture(_kern_fn(mk, ws, blocks, xs_by_m[M], outs_by_m[M], v, w))
+                        burst = ev_time(g.replay, 20) / nl
+                        smi = subprocess.Popen(["rocm-smi", "--showclocks", "--showpower"], stdout=subprocess.PIPE,
+                                               stderr=subprocess.DEVNULL, text=True) if rep == 0 else None
+                        st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        n, t0 = 0, time.time()
+                        st.record()
+                        while time.time() - t0 < 1.5:
+                            for _ in range(20):
+                                g.replay()
+                            n += 20
+                            torch.cuda.synchronize()
+                        en.record()
+                        torch.cuda.synchronize()
+                        sus = st.elapsed_time(en) * 1000.0 / n / nl
+                        clocks = []
+                        if smi is not None:
+                            try:
+                                so, _ = smi.communicate(timeout=30)
+                                clocks = [ln.strip() for ln in so.splitlines() if ln.startswith(("GPU[0]", "GPU[1]"))
+                                          and ("sclk" in ln or "mclk" in ln or "Power" in ln)]
+                            except Exception as e:  # noqa: BLE001
+                                clocks = [f"rocm-smi: {e}"]
+                        del g
+                        row = {"NL": nl, "sibling": sibling, "M": M, "variant": name, "rep": rep,
+                               "burst_us": round(burst, 2), "sustained_us": round(sus, 2),
+                               "grid": mk.max_grid(M, v, 0, w)}
+                        out["sweep"].append(row)
+                        log("P29", row, *(["clocks", clocks] if clocks else []))
+            # stamped default: phase table, alone and with the sibling running the unstamped default
+            if rep == 0:
+                name, v, w = P29_STAMPED
+                for sibling in (0, 1):
+                    for M in (1, 2):
+                        _sib_set(ctrl, f"{v & ~8} {w} {M}" if sibling else "idle")
+                        G = mk.max_grid(M, v, 0, w)
+                        g = capture(_kern_fn(mk, ws, blocks, xs_by_m[M], outs_by_m[M], v, w))
+                        rows = []
+                        for _ in range(30):
+                            g.replay()
+                            torch.cuda.synchronize()
+                            rows.append(phases(views["stamps"].clone(), min(G, 256)))
+                        t_graph = ev_time(g.replay, 20) / nl
+                        del g
+                        agg = {k: round(sorted(r[k] for r in rows)[len(rows) // 2], 2) for k in rows[0]}
+                        agg.update(graph_us_per_block=round(t_graph, 2), grid=G,
+                                   graph_over_span=round(t_graph / max(agg["span"], 1e-6), 3))
+                        key = f"NL={nl} sib={sibling} M={M}"
+                        out["phases"][key] = agg
+                        log("P29 phases", key, agg)
+        _sib_set(ctrl, "idle")
+        _write(ctrl, "exit")
+        sib.wait(timeout=120)
+        del blocks, xs_by_m, outs_by_m
+        torch.cuda.empty_cache()
+    # summary: per (NL, sibling, M, variant), the min over reps
+    summ = {}
+    for r in out["sweep"]:
+        k = (r["NL"], r["sibling"], r["M"], r["variant"])
+        b, s_ = summ.get(k, (1e9, 1e9))
+        summ[k] = (min(b, r["burst_us"]), min(s_, r["sustained_us"]))
+    for k in sorted(summ):
+        log("P29SUM NL=%d sib=%d M=%d %-12s burst %.2f sustained %.2f" % (*k, *summ[k]))
+    out["summary"] = {"%d,%d,%d,%s" % k: v for k, v in summ.items()}
+    log("RESULT " + json.dumps(out, default=str))
+
+
 # ------------------------------------------------------------------------------------ main
 def main():
     props = torch.cuda.get_device_properties(0)
@@ -497,4 +698,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main() if "--stage1" in sys.argv else variants_main())
+    if "--sibling" in sys.argv:
+        i = sys.argv.index("--sibling")
+        sys.exit(sibling_main(int(sys.argv[i + 1]), sys.argv[i + 2]))
+    sys.exit(main() if "--stage1" in sys.argv else mi250_main() if "--mi250" in sys.argv else variants_main())

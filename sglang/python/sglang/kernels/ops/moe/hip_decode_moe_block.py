@@ -52,6 +52,17 @@ _calls = 0
 _logged = False
 
 
+@functools.lru_cache(maxsize=None)
+def default_config() -> tuple[int, int]:
+    """(variant, workgroups per CU): the constants above unless SGLANG_HIP_DECODE_MK_VARIANT /
+    SGLANG_HIP_DECODE_MK_WG_PER_CU override them (-1, the default, keeps the constants)."""
+    from sglang.srt.environ import envs
+
+    v = int(envs.SGLANG_HIP_DECODE_MK_VARIANT.get())
+    w = int(envs.SGLANG_HIP_DECODE_MK_WG_PER_CU.get())
+    return (DEFAULT_VARIANT if v < 0 else v, DEFAULT_WG_PER_CU if w < 1 else w)
+
+
 def env_enabled() -> bool:
     from sglang.srt.environ import envs
 
@@ -92,9 +103,11 @@ def _dev_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def max_grid(m: int, variant: int, device_index: int, wg_per_cu: int = DEFAULT_WG_PER_CU) -> int:
-    """Grid for M rows and a variant: wg_per_cu workgroups per CU, capped by co-residency
-    (cached per device; the grid barrier needs every workgroup resident)."""
+def max_grid(m: int, variant: int, device_index: int, wg_per_cu: Optional[int] = None) -> int:
+    """Grid for M rows and a variant: wg_per_cu workgroups per CU (default_config() if None),
+    capped by co-residency (cached per device; the grid barrier needs every workgroup resident)."""
+    if wg_per_cu is None:
+        wg_per_cu = default_config()[1]
     key = (device_index, m, variant, wg_per_cu)
     g = _grids.get(key)
     if g is None:
@@ -116,7 +129,7 @@ def _prepare(device: torch.device) -> Optional[torch.Tensor]:
         if torch.cuda.is_current_stream_capturing():
             return None
         for m in range(1, CHUNK_M + 1):  # co-residency of the default grid, checked up front
-            max_grid(m, DEFAULT_VARIANT, idx)
+            max_grid(m, default_config()[0], idx)
         ws = torch.zeros(_WS_BYTES, dtype=torch.uint8, device=device)
         _workspaces[idx] = ws
     return ws
@@ -162,7 +175,7 @@ def decode_moe_block(
     if ws is None:
         return None
     idx = _dev_index(x.device)
-    v = DEFAULT_VARIANT if variant is None else variant
+    v = default_config()[0] if variant is None else variant
     if out is None:
         out = torch.empty_like(x)
     for r0 in range(0, x.shape[0], CHUNK_M):

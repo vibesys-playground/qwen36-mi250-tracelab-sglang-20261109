@@ -1121,6 +1121,10 @@ class Envs:
     # One-launch decode MoE block on gfx90a for BF16 Qwen3.5/3.6-MoE at decode M <= 4
     # (kernels/aot/csrc/moe/hip_decode_moe_block.hip). Set to 0 to use the per-op path.
     SGLANG_HIP_DECODE_MEGAKERNEL = EnvBool(True)
+    # Overrides for its variant bits and workgroups per CU (-1: the module defaults). Every
+    # built variant gives bitwise identical outputs; these change only speed.
+    SGLANG_HIP_DECODE_MK_VARIANT = EnvInt(-1)
+    SGLANG_HIP_DECODE_MK_WG_PER_CU = EnvInt(-1)
     # gfx90a TP=2 decode boundaries over P2P (kernels/ops/gemm/skinny_p2p_hip.py). The first
     # switches all of them; each part has its own: the out_proj/o_proj GEMV with the
     # all-reduce + add + norm epilogue (A), the P2P all-reduce + add + norm kernel at the other
