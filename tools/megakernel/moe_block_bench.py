@@ -1,4 +1,4 @@
-"""Plan 13 stage 1: the one-launch decode MoE block (sgl_kernel hip_decode_moe_block) against
+"""Plan 13 stage 1 / plan 23: the one-launch decode MoE block (sgl_kernel hip_decode_moe_block) against
 the head's per-op MoE sequence for the same block, on one gfx90a GCD.
 
 Head sequence (as Qwen2MoeSparseMoeBlock.forward runs it on HIP decode): router linear and the
@@ -12,6 +12,11 @@ Checks: error against an fp32 reference, routing ids against the head router on 
 own logits (including forced ties), end-to-end id agreement with the head, bitwise
 repeatability, graph == eager, batch invariance (M = 1..8) and grid invariance.
 Prints one JSON line starting with "RESULT ".
+
+Plan 23 (``--variants``, the default): sweeps kernel variants (bits: 1 DPP top-8, 2 pipelined
+w13/w2 loops, 4 DPP wave sums) and workgroups per CU; for each, the checks above and graph
+replay us at M=1, 2, 4 (three interleaved repeats), plus per-phase times from the stamped
+build (bit 8: s_memrealtime per wave at phase boundaries, 100 MHz).
 """
 
 import contextlib
@@ -186,6 +191,174 @@ def rel_err(a, ref):
     return ((a.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-12)).item()
 
 
+# ------------------------------------------------------------------------------------ plan 23
+VARIANTS = [  # (name, variant bits, workgroups per CU)
+    ("base", 0, 1), ("topk", 1, 1), ("pipe", 2, 1), ("topk+pipe", 3, 1), ("dsum", 4, 1),
+    ("topk+dsum", 5, 1), ("topk+dsum/2", 5, 2), ("topk+dsum/3", 5, 3), ("all", 7, 1), ("all/2", 7, 2),
+    ("pipe+dsum/2", 6, 2), ("base/2", 0, 2),
+]
+TICK_US = 0.01  # s_memrealtime is 100 MHz on gfx90a
+
+
+def phases(st, G):
+    s = st[:G].reshape(G * 4, 8)[:, :7].double()
+    t = (s - s[:, 0].min()) * TICK_US
+    med = t.median(0).values
+    mx = t.max(0).values
+    return {"start_spread": mx[0].item(), "A": med[1].item(), "wait": (med[2] - med[1]).item(),
+            "route": (med[3] - med[2]).item(), "w13_med": (med[4] - med[3]).item(),
+            "w13_tail": (mx[4] - med[4]).item(), "barrier": (med[5] - mx[4]).item(),
+            "B": (mx[6] - med[5]).item(), "span": mx[6].item()}
+
+
+def variants_main():
+    props = torch.cuda.get_device_properties(0)
+    cu = props.multi_processor_count
+    log("device:", props.name, props.gcnArchName, "CUs", cu)
+    from sglang.kernels.ops.moe import hip_decode_moe_block as mk
+
+    log("platform_ok", mk.platform_ok())
+    co = {(m, v): torch.ops.sgl_kernel.hip_decode_moe_block_max_grid(m, v) for m in (1, 2) for v in range(16)}
+    log("co-resident grid by (M, variant):", co)
+    RES["co_grid"] = {f"{m},{v}": g for (m, v), g in co.items()}
+    head, route = setup_head()
+    gen = torch.Generator(device=DEV).manual_seed(4321)
+    blocks = [make_block(gen, ties=(i == 1)) for i in range(NLAYERS)]
+    torch.cuda.synchronize()
+
+    def grid_of(m, v, wpc):
+        return mk.max_grid(m, v, 0, wpc)
+
+    def kern(L, x, v, wpc, out=None, grid=None):
+        if out is None:
+            out = torch.empty_like(x)
+        for r0 in range(0, x.shape[0], 2):
+            xm = x[r0:r0 + 2]
+            g = grid or grid_of(xm.shape[0], v, wpc)
+            torch.ops.sgl_kernel.hip_decode_moe_block(xm, L["router"], L["sgu"], L["sgate"], L["sdown"], L["w13"],
+                                                      L["w2"], out[r0:r0 + 2], ws, g, v)
+        return out
+
+    mk._prepare(DEV)
+    ws = mk._workspaces[0]
+    views = mk.workspace_views(DEV)
+
+    # ---- checks per variant
+    x8 = bf(torch.randn(8, HID, device=DEV, generator=gen))
+    xc = [bf(torch.randn(2, HID, device=DEV, generator=gen)) for _ in range(4)]
+    y8_base = kern(blocks[0], x8, 0, 1).clone()
+    yc_base = [kern(blocks[i], xc[i], 0, 1).clone() for i in range(4)]
+    ok_by = {}
+    for name, v, wpc in VARIANTS:
+        if co[(2, v)] < wpc * cu and wpc > 1:
+            log("skip", name, "not co-resident:", co[(2, v)])
+            continue
+        c = {"grid_M1": grid_of(1, v, wpc), "grid_M2": grid_of(2, v, wpc)}
+        y8 = kern(blocks[0], x8, v, wpc).clone()
+        c["bitwise_eq_base"] = bool(torch.equal(y8, y8_base)) and all(
+            torch.equal(kern(blocks[i], xc[i], v, wpc), yc_base[i]) for i in range(4))
+        errs, ids_ok = [], True
+        for i in range(4):
+            y = kern(blocks[i], xc[i], v, wpc)
+            torch.cuda.synchronize()
+            ids, wts, logits = views["ids"][:2].clone(), views["wts"][:2].clone(), views["logits"][:2].clone()
+            tw, ti = route(logits.contiguous())
+            ids_ok &= bool(torch.equal(ids, ti.to(torch.int32)))
+            h = head(blocks[i], xc[i])
+            errs.append((rel_err(y, reference(blocks[i], xc[i], ids, wts)),
+                         rel_err(h["out"], reference(blocks[i], xc[i], h["ids"], h["wts"]))))
+        c["ids_equal_head_router_same_logits"] = ids_ok
+        c["relerr_kern_head"] = errs
+        c["relerr_ok"] = all(k <= max(2 * hh, 1e-2) for k, hh in errs)
+        c["repeatable_50"] = all(torch.equal(kern(blocks[0], x8, v, wpc), y8) for _ in range(50))
+        inv = {m: bool(torch.equal(kern(blocks[0], x8[:m].contiguous(), v, wpc), y8[:m])) for m in range(1, 8)}
+        inv["grid_half"] = bool(torch.equal(kern(blocks[0], x8, v, wpc, grid=cu // 2), y8))
+        c["batch_invariant"] = all(inv.values())
+        out_buf = torch.empty_like(x8)
+        g = capture(lambda: kern(blocks[0], x8, v, wpc, out=out_buf))
+        out_buf.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        c["graph_equals_eager"] = bool(torch.equal(out_buf, y8))
+        del g
+        c["sync_err"] = int(views["sync"][128].item())
+        c["ok"] = (ids_ok and c["relerr_ok"] and c["repeatable_50"] and c["batch_invariant"]
+                   and c["graph_equals_eager"] and c["sync_err"] == 0)
+        ok_by[name] = c["ok"]
+        RES.setdefault("checks", {})[name] = c
+        log("check", name, f"v={v} wpc={wpc}", c)
+
+    # ---- timing: graph replay per block, M = 1, 2, 4; three interleaved repeats
+    names = [n for n, _, _ in VARIANTS if n in ok_by]
+    vmap = {n: (v, w) for n, v, w in VARIANTS}
+    tim = {}
+    xs_by_m = {M: [bf(torch.randn(M, HID, device=DEV, generator=gen)) for _ in range(NLAYERS)] for M in (1, 2, 4)}
+    for rep in range(3):
+        for M in (1, 2, 4):
+            xs = xs_by_m[M]
+            outs = [torch.empty_like(x) for x in xs]
+            for n in names:
+                v, w = vmap[n]
+                t = graph_time(lambda: [kern(L, x, v, w, out=o) for L, x, o in zip(blocks, xs, outs)]) / NLAYERS
+                tim.setdefault((n, M), []).append(t)
+            if rep == 0:
+                tim[("new_head", M)] = [graph_time(lambda: [head(L, x) for L, x in zip(blocks, xs)]) / NLAYERS]
+    ne = {M: sum(int(torch.unique(head(L, x)["ids"]).numel()) for L, x in zip(blocks, xs_by_m[M])) / NLAYERS
+          for M in (1, 2, 4)}
+    mb = {M: ((NE + 2 * INTER + 1) * HID * 2 + HID * INTER * 2 + ne[M] * (2 * INTER * HID + HID * INTER) * 2) / 1e6
+          for M in (1, 2, 4)}
+    table = []
+    for n in names + ["new_head"]:
+        row = {"variant": n}
+        for M in (1, 2, 4):
+            ts = tim[(n, M)]
+            row[f"M{M}_us"] = round(min(ts), 2)
+            row[f"M{M}_reps"] = [round(t, 2) for t in ts]
+            row[f"M{M}_TBps"] = round(mb[M] / min(ts) / 1e6, 3)
+        table.append(row)
+        log("timing", row)
+    RES["timing"] = table
+    RES["MB"] = mb
+
+    # ---- per-phase times from the stamped build (last layer of an 8-layer graph, 30 replays)
+    ph = {}
+    for n in ["base", "topk", "topk+pipe", "topk+dsum", "topk+dsum/2", "topk+dsum/3", "all", "all/2"]:
+        if n not in ok_by:
+            continue
+        v, w = vmap[n]
+        vs = v | 8
+        if co[(2, vs)] < w * cu and w > 1:
+            continue
+        for M in (1, 2):
+            xs = xs_by_m[M]
+            outs = [torch.empty_like(x) for x in xs]
+            G = grid_of(M, vs, w)
+            g = capture(lambda: [kern(L, x, vs, w, out=o) for L, x, o in zip(blocks, xs, outs)])
+            rows = []
+            for _ in range(30):
+                g.replay()
+                torch.cuda.synchronize()
+                rows.append(phases(views["stamps"].clone(), min(G, 256)))
+            t_graph = ev_time(g.replay, 20) / NLAYERS
+            del g
+            agg = {k: round(sorted(r[k] for r in rows)[len(rows) // 2], 2) for k in rows[0]}
+            agg["graph_us_per_block"] = round(t_graph, 2)
+            agg["grid"] = G
+            ph[f"{n} M={M}"] = agg
+            log("phases", n, f"M={M}", agg)
+    RES["phases"] = ph
+
+    good = [r for r in table if r["variant"] != "new_head" and ok_by.get(r["variant"])]
+    best = min(good, key=lambda r: r["M2_us"])
+    best1 = min(good, key=lambda r: r["M1_us"])
+    RES["gate"] = {"best_M2": best["variant"], "M2_us": best["M2_us"], "M1_us_of_best_M2": best["M1_us"],
+                   "best_M1": best1["variant"], "M1_us": best1["M1_us"],
+                   "pass": best["M2_us"] <= 56 and best["M1_us"] <= 34,
+                   "kill": best["M2_us"] > 58}
+    log("GATE", RES["gate"])
+    log("RESULT " + json.dumps(RES, default=str))
+
+
 # ------------------------------------------------------------------------------------ main
 def main():
     props = torch.cuda.get_device_properties(0)
@@ -193,7 +366,7 @@ def main():
     from sglang.kernels.ops.moe import hip_decode_moe_block as mk
 
     log("platform_ok", mk.platform_ok(), "env_enabled", mk.env_enabled())
-    log("max grid by M:", {m: torch.ops.sgl_kernel.hip_decode_moe_block_max_grid(m) for m in range(1, 9)})
+    log("max grid by M:", {m: torch.ops.sgl_kernel.hip_decode_moe_block_max_grid(m, 0) for m in range(1, 9)})
     head, route = setup_head()
     gen = torch.Generator(device=DEV).manual_seed(4321)
     blocks = [make_block(gen, ties=(i == 1)) for i in range(NLAYERS)]
@@ -307,4 +480,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() if "--stage1" in sys.argv else variants_main())

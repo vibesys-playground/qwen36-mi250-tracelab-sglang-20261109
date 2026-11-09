@@ -86,7 +86,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("deterministic_all_reduce_unreg", torch::kCUDA, &deterministic_all_reduce_unreg);
 
   /*
-   * From csrc/moe: one-launch decode MoE block for gfx90a (Qwen3.5/3.6-MoE, M <= 8)
+   * From csrc/moe: one-launch decode MoE block for gfx90a (Qwen3.5/3.6-MoE; M <= 2, variants)
    */
   extern void hip_decode_moe_block(
       torch::Tensor& x,
@@ -98,11 +98,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       torch::Tensor& w2,
       torch::Tensor& out,
       torch::Tensor& ws,
-      int64_t grid);
-  extern int64_t hip_decode_moe_block_max_grid(int64_t m);
+      int64_t grid,
+      int64_t variant);
+  extern int64_t hip_decode_moe_block_max_grid(int64_t m, int64_t variant);
   m.def(
       "hip_decode_moe_block(Tensor x, Tensor w_router, Tensor w_sgu, Tensor w_sgate, Tensor w_sdown, "
-      "Tensor w13, Tensor w2, Tensor! out, Tensor! ws, int grid) -> ()");
+      "Tensor w13, Tensor w2, Tensor! out, Tensor! ws, int grid, int variant) -> ()");
   m.impl("hip_decode_moe_block", torch::kCUDA, &hip_decode_moe_block);
   m.def("hip_decode_moe_block_max_grid", &hip_decode_moe_block_max_grid);
 

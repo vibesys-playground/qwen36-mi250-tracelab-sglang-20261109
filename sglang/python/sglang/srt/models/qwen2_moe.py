@@ -443,8 +443,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
         # Weights for the one-launch HIP decode MoE block, resolved at the first decode
-        # call (after weight loading); None keeps the per-op path.
+        # call (after weight loading) and again whenever a weight's storage changes (a
+        # weight reload that replaces parameters); None keeps the per-op path.
         self._hip_decode_mk_args: Optional[tuple] = None
+        self._hip_decode_mk_key: Optional[tuple] = None
         self._hip_decode_mk_resolved = not (
             _is_hip and envs.SGLANG_HIP_DECODE_MEGAKERNEL.get()
         )
@@ -736,11 +738,32 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if not self._hip_decode_mk_resolved:
             self._hip_decode_mk_resolved = True
             self._hip_decode_mk_args = self._hip_decode_megakernel_weights()
+            if self._hip_decode_mk_args is not None:
+                self._hip_decode_mk_key = self._hip_decode_megakernel_key()
+        elif (
+            self._hip_decode_mk_args is not None
+            and self._hip_decode_megakernel_key() != self._hip_decode_mk_key
+        ):
+            # Parameters were replaced (weight reload): re-resolve the cached views.
+            self._hip_decode_mk_key = self._hip_decode_megakernel_key()
+            self._hip_decode_mk_args = self._hip_decode_megakernel_weights()
         if self._hip_decode_mk_args is None or not hidden_states.is_contiguous():
             return None
         return hip_decode_moe_block.decode_moe_block(
             hidden_states, *self._hip_decode_mk_args
         )
+
+    def _hip_decode_megakernel_key(self) -> tuple:
+        """Storage of every weight the megakernel reads; changes when a reload replaces one."""
+        ws = (
+            self.gate.weight,
+            self.shared_expert.gate_up_proj.weight,
+            self.shared_expert_gate.weight,
+            self.shared_expert.down_proj.weight,
+            self.experts.w13_weight,
+            self.experts.w2_weight,
+        )
+        return tuple((w.data_ptr(), tuple(w.shape)) for w in ws)
 
     def _hip_decode_megakernel_weights(self) -> Optional[tuple]:
         """(router, shared gate_up, shared gate, shared down, w13, w2) when this block is the
