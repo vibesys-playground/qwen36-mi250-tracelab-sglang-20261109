@@ -42,6 +42,11 @@ fi
 #   emitted tokens are the target's greedy tokens. 8 running requests per replica bounds the
 #   per-position GDN state scratch (the workload runs 8 sessions over 4 replicas). k=2: a
 #   bs=2 verify step costs 1.85x a plain decode step (k=3: 2.00x).
+#   Drafts are looked up on the GPU from a per-slot copy of the request's own ids, and a step
+#   where no running request matched an n-gram last step runs the plain decode graph (T=1).
+#   The overlap scheduler is off: with it on, a new request's prefill queues behind the longer
+#   verify step and TTFT p50 rises ~9 ms; with it off, TTFT matches the non-speculative head
+#   (full-trace replay at 2 sessions, plan 27 stage 2: 269 vs 234 tok/s, TTFT p50 85.3 vs 85.3 ms).
 export SGLANG_NGRAM_PROMPT_LOOKUP=1
 export SGLANG_NGRAM_DECODE_VERIFY=1
 exec python3 -m sglang.launch_server "$@" \
@@ -58,4 +63,5 @@ exec python3 -m sglang.launch_server "$@" \
   --speculative-num-draft-tokens "${SGLANG_NGRAM_DRAFT_TOKENS:-3}" \
   --speculative-ngram-max-bfs-breadth 1 \
   --max-running-requests 8 \
-  --cuda-graph-max-bs-decode 8
+  --cuda-graph-max-bs-decode 8 \
+  --disable-overlap-schedule

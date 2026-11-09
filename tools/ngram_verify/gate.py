@@ -264,7 +264,7 @@ def compare(results, prompts, logs):
             lines.append(r["replay"])
     lines.append("=== speed (wall tok/s, 512 new tokens) ===")
     for name, r in results.items():
-        if r is not None:
+        if r is not None and "speed" in r:
             lines.append(f"{name:7s} {r['speed']}{'  (EAGER: graph capture failed)' if r.get('eager') else ''}")
     lines.append("=== server logs ===")
     for name, f in logs.items():
@@ -370,7 +370,13 @@ async def main():
         results.update(zip(names, rs))
     names = [n for ph in PHASES for n in ph]
     json.dump(results, open(OUT / "results.json", "w"))
-    log(compare(results, prompts, {n: OUT / f"server_{n}.log" for n in names}))
+    try:
+        log(compare(results, prompts, {n: OUT / f"server_{n}.log" for n in names}))
+    except Exception as e:  # noqa: BLE001
+        # OUT dies with the job, so the raw outputs go to the log for offline comparison.
+        log(f"compare failed: {type(e).__name__}: {e}")
+        log("RESULTS_JSON " + json.dumps({n: (r and {k: v for k, v in r.items() if k != "replay"}) for n, r in results.items()}))
+        return 1
     return 0
 
 
