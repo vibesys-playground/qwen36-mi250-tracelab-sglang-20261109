@@ -137,7 +137,7 @@ for e in win:
 print("TOP kernels (by name+grid/block):")
 for (n, g), (v, c, l) in sorted(bg.items(), key=lambda x: -x[1][0])[:60]:
     print(f"  KG {v/nsteps:8.0f} us/step n/step {c/nsteps:6.1f} avg {v/c:7.1f} p50 {statistics.median(l):7.1f} us [{cat_of({'name':n,'cat':'kernel'})}] {n} grid/block {g}")
-if graphs and nsteps > 1:
+if graphs:  # also with one correlated replay (j153 traces matched only one)
     nk = [len(g["k"]) for g in graphs]
     mode = statistics.mode(nk)
     same = [sorted(g["k"], key=lambda e: e["ts"]) for g in graphs if len(g["k"]) == mode]
