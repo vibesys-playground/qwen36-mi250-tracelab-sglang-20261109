@@ -49,7 +49,7 @@ BASE_FLAGS = [
     "--cuda-graph-backend-prefill", "breakable", "--cuda-graph-max-bs-prefill", "2816",
     "--enable-cache-report", "--mamba-track-interval", "64",
     "--default-chat-template-kwargs", '{"enable_thinking": false}',
-    "--max-running-requests", "8", "--cuda-graph-max-bs", "8",
+    "--max-running-requests", "8", "--cuda-graph-max-bs-decode", "8",
 ]
 SPEC = ["--speculative-algorithm", "NGRAM", "--speculative-ngram-max-bfs-breadth", "1"]
 SPEC_ENV = {"SGLANG_NGRAM_PROMPT_LOOKUP": "1", "SGLANG_NGRAM_DECODE_VERIFY": "1"}
