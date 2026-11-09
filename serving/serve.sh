@@ -57,4 +57,4 @@ exec python3 -m sglang.launch_server "$@" \
   --speculative-num-draft-tokens "${SGLANG_NGRAM_DRAFT_TOKENS:-4}" \
   --speculative-ngram-max-bfs-breadth 1 \
   --max-running-requests 8 \
-  --cuda-graph-max-bs 8
+  --cuda-graph-max-bs-decode 8
