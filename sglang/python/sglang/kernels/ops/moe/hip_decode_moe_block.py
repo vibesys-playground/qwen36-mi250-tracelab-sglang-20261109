@@ -5,7 +5,7 @@ top-8 softmax routing with renormalize, one shared expert of intermediate 256 pe
 a sigmoid gate) and a few decode rows, one persistent launch computes the router linear, the
 softmax top-8 routing (lowest expert id wins ties), the routed experts, the shared expert
 and ``routed + sigmoid(gate) * shared``. The TP all-reduce stays with the caller. The model
-sends M <= DISPATCH_MAX_M rows, in launches of at most CHUNK_M rows.
+sends M <= DISPATCH_MAX_M rows; ``launch_rows`` splits them into launches of at most MAX_M.
 
 The kernel needs a workspace whose barrier counters start at zero and reset themselves; it
 is allocated once per device outside graph capture. The workspace is per device, not per
@@ -13,7 +13,8 @@ stream: launches that share it must be ordered, which holds because the model ru
 decode forward (eager or graph replay) on one stream per device. If the first call comes
 during capture the caller keeps the per-op path. ``SGLANG_HIP_DECODE_MEGAKERNEL=0`` turns
 it off. A barrier spin that times out sets an error word in the workspace; ``check_error``
-reads it, logs it and resets the counters (decode_moe_block calls it on eager calls).
+reads it, logs it and resets the counters (decode_moe_block calls it on eager calls), and
+``poll_error``, called after each decode graph replay, does the same without a sync.
 """
 
 from __future__ import annotations
@@ -27,29 +28,33 @@ import torch
 logger = logging.getLogger(__name__)
 
 HIDDEN, NUM_EXPERTS, INTER, TOPK, MAX_M = 2048, 256, 256, 8, 8
-# Measured with tools/megakernel/moe_block_bench.py on gfx90a (us per block, graph replay):
-# j119 (MI250 GCD, variant 0, 1 WG/CU) M=1 40 vs 84 per-op, M=2 64 vs 107; M=4 as two M=2
-# launches 127 vs 147. Larger batches keep the per-op path.
-DISPATCH_MAX_M = 4
-CHUNK_M = 2
+DISPATCH_MAX_M = 16
 # Kernel variant bits (see hip_decode_moe_block.hip): 1 DPP top-8, 4 DPP wave sums, 8 phase
-# stamps (debug), 16 phase-B inputs staged in LDS, 32 two phase-B tasks per iteration, 64 two
-# w13 tasks per iteration. Only the combinations listed in the .hip ("Built") exist.
-F_TOPK, F_DSUM, F_STAMP, F_LDSB, F_B2, F_W2X = 1, 4, 8, 16, 32, 64
-# Plan 23, j151 (MI210, same gfx90a ISA and 104 CUs as an MI250 GCD), us per block in graph
-# replay, M=1 / M=2: variant 0 at 1 WG/CU 39.4 / 62.8; DPP top-8 36.8 / 59.7; + DPP sums
-# 36.0 / 55.2; + LDS-staged phase B at 2 WG/CU (the default) 34.5 / 53.5. Two-task
-# iterations (32, 64) did not help. All bitwise repeatable, batch and grid invariant.
-DEFAULT_VARIANT = F_TOPK | F_DSUM | F_LDSB
+# stamps (debug), 16 per-token phase B with LDS-staged inputs, 128 expert-stationary phase B,
+# 256 its first w2 loads issued before the grid barrier, 512 x read from L2 (always for M > 4).
+# Only the (M, variant) pairs listed in the .hip (built_mv) exist.
+F_TOPK, F_DSUM, F_STAMP, F_LDSB, F_ES, F_PRE, F_XG = 1, 4, 8, 16, 128, 256, 512
+# Plan 23 default (per-token phase B): the bitwise reference of the expert-stationary form.
+REF_VARIANT = F_TOPK | F_DSUM | F_LDSB
+DEFAULT_VARIANT = F_TOPK | F_DSUM | F_ES | F_PRE
 # Workgroups per CU in the grid, capped by what is co-resident for the variant and M.
 DEFAULT_WG_PER_CU = 2
-_WS_BYTES = 131072
+_WS_BYTES = 65536 + 256 * 4 * 16 * 8
 _SYNC_ERR, _SYNC_WORDS = 128, (0, 128, 192)  # int32 indices: error word; count, err, router
 _ERR_CHECK_EVERY = 256
 _workspaces: dict[int, torch.Tensor] = {}
 _grids: dict[tuple, int] = {}
 _calls = 0
+_polls = 0
+_poll_pending: Optional[tuple] = None  # (event, pinned error words, device indices)
 _logged = False
+
+
+def launch_rows(m: int) -> list[int]:
+    """Rows per launch for a batch of m rows: one launch up to MAX_M, else near-equal parts.
+    Each row's result is the same for any split."""
+    n = -(-m // MAX_M)
+    return [m // n + (1 if i < m % n else 0) for i in range(n)]
 
 
 def env_enabled() -> bool:
@@ -115,7 +120,7 @@ def _prepare(device: torch.device) -> Optional[torch.Tensor]:
     if ws is None:
         if torch.cuda.is_current_stream_capturing():
             return None
-        for m in range(1, CHUNK_M + 1):  # co-residency of the default grid, checked up front
+        for m in range(1, MAX_M + 1):  # co-residency of the default grid, checked up front
             max_grid(m, DEFAULT_VARIANT, idx)
         ws = torch.zeros(_WS_BYTES, dtype=torch.uint8, device=device)
         _workspaces[idx] = ws
@@ -142,6 +147,34 @@ def check_error(device: torch.device) -> bool:
     return True
 
 
+def poll_error() -> None:
+    """Out-of-replay spin-timeout check, cheap enough to call after every decode graph replay:
+    every _ERR_CHECK_EVERY calls it reads the error words copied (asynchronously) at the previous
+    poll, then queues a new copy; nothing synchronizes. A timeout is logged and the counters
+    reset as in check_error."""
+    global _polls, _poll_pending
+    if not _workspaces:
+        return
+    _polls += 1
+    if _polls % _ERR_CHECK_EVERY:
+        return
+    if _poll_pending is not None:
+        ev, words, idxs = _poll_pending
+        if not ev.query():
+            return
+        _poll_pending = None
+        for k, idx in enumerate(idxs):
+            if int(words[k]) != 0:
+                check_error(torch.device("cuda", idx))
+    idxs = tuple(_workspaces)
+    words = torch.empty(len(idxs), dtype=torch.int32, pin_memory=True)
+    for k, idx in enumerate(idxs):
+        words[k : k + 1].copy_(_workspaces[idx][:1024].view(torch.int32)[_SYNC_ERR : _SYNC_ERR + 1], non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record()
+    _poll_pending = (ev, words, idxs)
+
+
 def decode_moe_block(
     x: torch.Tensor,
     w_router: torch.Tensor,
@@ -154,9 +187,9 @@ def decode_moe_block(
     grid: Optional[int] = None,
     variant: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
-    """MoE block output for ``x`` [M <= 8, 2048] (before the TP all-reduce), or None if the
-    kernel cannot run here (the caller then takes the per-op path). Rows go in launches of
-    CHUNK_M; each row's result is the same for any chunking, M or grid."""
+    """MoE block output for ``x`` [M <= DISPATCH_MAX_M, 2048] (before the TP all-reduce), or
+    None if the kernel cannot run here (the caller then takes the per-op path). Rows go in
+    launches of launch_rows(M); each row's result is the same for any split, M or grid."""
     global _logged, _calls
     ws = _prepare(x.device)
     if ws is None:
@@ -165,22 +198,23 @@ def decode_moe_block(
     v = DEFAULT_VARIANT if variant is None else variant
     if out is None:
         out = torch.empty_like(x)
-    for r0 in range(0, x.shape[0], CHUNK_M):
-        m = min(CHUNK_M, x.shape[0] - r0)
+    r0 = 0
+    for m in launch_rows(x.shape[0]):
         g = grid or max_grid(m, v, idx)
         torch.ops.sgl_kernel.hip_decode_moe_block(
-            x[r0 : r0 + CHUNK_M],
+            x[r0 : r0 + m],
             w_router,
             w_sgu,
             w_sgate,
             w_sdown,
             w13,
             w2,
-            out[r0 : r0 + CHUNK_M],
+            out[r0 : r0 + m],
             ws,
             g,
             v,
         )
+        r0 += m
     if not torch.cuda.is_current_stream_capturing():
         _calls += 1
         if _calls % _ERR_CHECK_EVERY == 0:
@@ -188,12 +222,12 @@ def decode_moe_block(
     if not _logged:
         _logged = True
         logger.info(
-            "HIP decode MoE megakernel: on (decode M<=%d, %d rows per launch, variant=%d, grid=%d); "
+            "HIP decode MoE megakernel: on (decode M<=%d, <=%d rows per launch, variant=%d, grid=%d at M=1); "
             "SGLANG_HIP_DECODE_MEGAKERNEL=0 disables",
             DISPATCH_MAX_M,
-            CHUNK_M,
+            MAX_M,
             v,
-            grid or max_grid(CHUNK_M, v, idx),
+            grid or max_grid(1, v, idx),
         )
     return out
 
@@ -206,5 +240,5 @@ def workspace_views(device: torch.device) -> dict:
     ids = ws[ids_off : ids_off + MAX_M * TOPK * 4].view(torch.int32).view(MAX_M, TOPK)
     wts = ws[ids_off + MAX_M * TOPK * 4 : ids_off + 2 * MAX_M * TOPK * 4].view(torch.float32).view(MAX_M, TOPK)
     sync = ws[:1024].view(torch.int32)
-    stamps = ws[65536:131072].view(torch.int64).view(256, 4, 8)
+    stamps = ws[65536:_WS_BYTES].view(torch.int64).view(256, 4, 16)
     return {"logits": r[:, :NUM_EXPERTS], "ids": ids, "wts": wts, "sync": sync, "stamps": stamps}

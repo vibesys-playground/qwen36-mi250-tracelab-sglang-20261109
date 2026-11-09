@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 import torch
 import tqdm
 
+from sglang.kernels.ops.moe import hip_decode_moe_block
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
@@ -2089,6 +2090,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            # The HIP MoE megakernel's spin-timeout word is not read inside replay.
+            hip_decode_moe_block.poll_error()
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

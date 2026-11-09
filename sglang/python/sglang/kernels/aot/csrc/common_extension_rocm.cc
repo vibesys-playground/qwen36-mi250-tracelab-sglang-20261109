@@ -86,7 +86,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("deterministic_all_reduce_unreg", torch::kCUDA, &deterministic_all_reduce_unreg);
 
   /*
-   * From csrc/moe: one-launch decode MoE block for gfx90a (Qwen3.5/3.6-MoE; M <= 2, variants)
+   * From csrc/moe: one-launch decode MoE block for gfx90a (Qwen3.5/3.6-MoE; M <= 8 per launch, variants)
    */
   extern void hip_decode_moe_block(
       torch::Tensor& x,
