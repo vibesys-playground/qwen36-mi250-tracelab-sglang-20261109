@@ -197,7 +197,7 @@ def rel_err(a, ref):
 # ------------------------------------------------------------------------------------ plan 28
 REF = 21  # plan 23 default (per-token phase B), launched in chunks of <= 2 rows as the head does
 VARIANTS = [  # (name, variant bits, workgroups per CU, max M built); bits in hip_decode_moe_block.hip
-    ("es/2", 133, 2, 4), ("es+pre/2", 389, 2, 8), ("es+pre+xg/2", 901, 2, 4), ("es+pre/3", 389, 3, 8),
+    ("es/2", 133, 2, 2), ("es+pre/2", 389, 2, 8), ("es+pre+cb4/2", 1413, 2, 2), ("es+pre/3", 389, 3, 8),
 ]
 TIME_MS = (1, 2, 3, 4, 8, 16)
 # s_memrealtime advances 25 ticks per us here (plan 23, j144/j151).
@@ -232,7 +232,7 @@ def plan28_main():
     log("platform_ok", mk.platform_ok())
     co = {}
     for m in range(1, 9):
-        for v in (0, REF, REF | 8, 133, 389, 397, 901):
+        for v in (0, REF, REF | 8, 133, 389, 397, 1413):
             g = torch.ops.sgl_kernel.hip_decode_moe_block_max_grid(m, v)
             if g:
                 co[(m, v)] = g
@@ -345,7 +345,7 @@ def plan28_main():
                 if n == "head_default" and M > 4:
                     continue
                 vm = next((mm for nn, vv, ww, mm in VARIANTS if nn == n.split(" ")[0]), 8)
-                if M > 4 and vm < 8:
+                if M > vm:
                     continue
                 if ch and M <= ch:
                     continue

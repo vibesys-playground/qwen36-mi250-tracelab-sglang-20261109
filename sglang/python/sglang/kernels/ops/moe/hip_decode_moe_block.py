@@ -31,9 +31,10 @@ HIDDEN, NUM_EXPERTS, INTER, TOPK, MAX_M = 2048, 256, 256, 8, 8
 DISPATCH_MAX_M = 16
 # Kernel variant bits (see hip_decode_moe_block.hip): 1 DPP top-8, 4 DPP wave sums, 8 phase
 # stamps (debug), 16 per-token phase B with LDS-staged inputs, 128 expert-stationary phase B,
-# 256 its first w2 loads issued before the grid barrier, 512 x read from L2 (always for M > 4).
+# 256 its first w2 loads issued before the grid barrier, 512 x read from L2 (always for M > 3),
+# 1024 4-item w2 windows.
 # Only the (M, variant) pairs listed in the .hip (built_mv) exist.
-F_TOPK, F_DSUM, F_STAMP, F_LDSB, F_ES, F_PRE, F_XG = 1, 4, 8, 16, 128, 256, 512
+F_TOPK, F_DSUM, F_STAMP, F_LDSB, F_ES, F_PRE, F_XG, F_CB4 = 1, 4, 8, 16, 128, 256, 512, 1024
 # Plan 23 default (per-token phase B): the bitwise reference of the expert-stationary form.
 REF_VARIANT = F_TOPK | F_DSUM | F_LDSB
 DEFAULT_VARIANT = F_TOPK | F_DSUM | F_ES | F_PRE

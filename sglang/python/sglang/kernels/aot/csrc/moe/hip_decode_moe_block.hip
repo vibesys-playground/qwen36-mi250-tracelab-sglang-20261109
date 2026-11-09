@@ -49,6 +49,7 @@
 //   F_LDSB  per-token phase B reads act, the shared act and the gate from LDS.
 //   F_ES    expert-stationary phase B (above).
 //   F_PRE   with F_ES: first w2 chunks issued before the grid barrier.
+//   F_CB4   with F_ES: 4-item w2 windows instead of 8 (smaller code, fewer loads in flight).
 //   F_XG    x is read from L2 per dot instead of held in registers (always on for M > XREG_MAX);
 //           w13 then computes dots only for the tokens routed to each expert. Same math.
 //
@@ -85,26 +86,26 @@ constexpr int NE = 256, INTER = 256, TOPK = 8, MAX_M = 8;
 constexpr int NROUTER = NE, NSGU = 2 * INTER;
 constexpr int R_STRIDE = NROUTER + NSGU;  // r row = [router logits | shared gate_up]
 constexpr unsigned SPIN_MAX = 1u << 24;
-constexpr int XREG_MAX = 4;  // x in registers up to this M
+constexpr int XREG_MAX = 3;  // x in registers up to this M (M = 4 needs > 256 VGPRs)
 
-constexpr int F_TOPK = 1, F_DSUM = 4, F_STAMP = 8, F_LDSB = 16, F_ES = 128, F_PRE = 256, F_XG = 512;
+constexpr int F_TOPK = 1, F_DSUM = 4, F_STAMP = 8, F_LDSB = 16, F_ES = 128, F_PRE = 256, F_XG = 512, F_CB4 = 1024;
 constexpr int V_REF = F_TOPK | F_DSUM | F_LDSB;  // plan 23 default (21): per-token phase B
 constexpr int V_DEF = F_TOPK | F_DSUM | F_ES | F_PRE;  // 389
 // Built (M, variant) pairs: 0 for M <= 8 (reference), 21 and its stamped build for M <= 2 (the
 // plan 23 default, the bitwise reference for the expert-stationary form), the default and its
-// stamped build for M <= 8; ES without pre-issue and the forced-L2 x for the bench, M <= 4.
+// stamped build for M <= 8; ES without pre-issue and with 4-item windows for the bench, M <= 2.
 constexpr bool built_mv(int m, int v) {
   return (v == 0 && m <= 8) || ((v == V_REF || v == (V_REF | F_STAMP)) && m <= 2) ||
          ((v == V_DEF || v == (V_DEF | F_STAMP)) && m <= 8) ||
-         ((v == (F_TOPK | F_DSUM | F_ES) || v == (V_DEF | F_XG)) && m <= 4);
+         ((v == (F_TOPK | F_DSUM | F_ES) || v == (V_DEF | F_CB4)) && m <= 2);
 }
 using AllV = std::integer_sequence<int, 0, V_REF, V_REF | F_STAMP, V_DEF, V_DEF | F_STAMP, F_TOPK | F_DSUM | F_ES,
-                                   V_DEF | F_XG>;
+                                   V_DEF | F_CB4>;
 inline bool built(int64_t m, int64_t v) { return m >= 1 && m <= MAX_M && v >= 0 && v < 4096 && built_mv((int)m, (int)v); }
 constexpr int NSTAMP = 16, STAMP_WG = 256;
 
 // Expert-stationary phase B: row pairs per workgroup block, w2 items per chunk per B wave.
-constexpr int PMAX = 12, RMAX = 2 * PMAX, NSLOT = TOPK + 1, CB = 16, NBW = WPB - 1;
+constexpr int PMAX = 12, RMAX = 2 * PMAX, NSLOT = TOPK + 1, CB = 8, NBW = WPB - 1;
 static_assert(CB <= 64 && (CB & (CB - 1)) == 0, "one lane per chunk item");
 constexpr int NBLK_MIN = (HID / 2 + PMAX - 1) / PMAX;
 
@@ -613,6 +614,7 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
     // Workgroup block b owns row pairs [p0, p0 + np); its items are (unit, row pair), unit-major,
     // taken round-robin by the B waves 1..3; an item is one 1 KB contiguous piece of w2.
     // Wave-uniform indices go through readfirstlane so the item arithmetic stays scalar.
+    constexpr int CB = (V & F_CB4) != 0 ? 4 : hip_decode_moe::CB;
     const int half = lane >> 5, kk = (lane & 31) * 8, bw = ufirst(wave) - 1;
     const int nu = ufirst(s_nu), NUe = nu + 1, G = gridDim.x;
     const int nblk = G > NBLK_MIN ? G : NBLK_MIN;
@@ -624,22 +626,35 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
       const int nwi = (bw >= 0 && nit > bw) ? (nit - bw + NBW - 1) / NBW : 0;
       nch = (nwi + CB - 1) / CB;
     };
-    // Lane l < CB describes item l of chunk c (clamped to the last item): its unit, row pair
-    // within the block and slab base. The per-item loop reads them with readlane, so it has no
-    // divisions and no LDS waits.
+    // Lane l < CB describes item l of window c (clamped to the last item): its unit, row pair
+    // within the block, slab base, token mask and packed slots (4 bits per token: the slot,
+    // TOPK for the shared down, 15 if not routed). The per-item loop reads them with readlane,
+    // so it has no divisions and no LDS waits; one dot body serves routed and shared items, so
+    // the code stays small (instruction-cache bound otherwise).
     struct ItemInfo {
-      int u, pl, valid;
+      int u, pl, valid, mask, kp;
       const uint16_t* base;
     };
-    auto item_info = [&](int c) {
+    auto item_info = [&](int c, bool slots) {
       const int il0 = bw + NBW * (c * CB + (lane & (CB - 1)));
       const int il = il0 < nit ? il0 : nit - 1;
       ItemInfo f;
       f.u = il / np;
       f.pl = il - f.u * np;
       f.valid = il0 < nit;
+      const bool routed = f.u < nu;
       const int e = s_ulist[f.u];
-      f.base = (f.u < nu ? a.w2 + (size_t)e * HID * INTER : a.w_sdown) + (size_t)(2 * (p0 + f.pl)) * INTER;
+      f.base = (routed ? a.w2 + (size_t)e * HID * INTER : a.w_sdown) + (size_t)(2 * (p0 + f.pl)) * INTER;
+      f.mask = 0;
+      f.kp = 0;
+      if (slots) {
+        f.mask = routed ? (int)s_umask[f.u] : (1 << M) - 1;
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+          const int k = routed ? (int)s_slot[f.u][m] : TOPK;
+          f.kp |= (k < 0 ? 15 : k) << (4 * m);
+        }
+      }
       return f;
     };
     auto rl_addr = [&](const uint16_t* p, int j) {
@@ -649,63 +664,31 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
       return ((uint64_t)h << 32) | l;
     };
     auto load_chunk = [&](int c, uint4 (&buf)[CB]) {
-      const ItemInfo f = item_info(c);
+      const ItemInfo f = item_info(c, false);
       const uint32_t off = (uint32_t)(half * INTER + kk) * 2u;
 #pragma unroll
       for (int j = 0; j < CB; ++j) buf[j] = ld16g(rl_addr(f.base, j) + off);
     };
     auto comp_chunk = [&](int c, const uint4 (&buf)[CB]) {
-      const ItemInfo f = item_info(c);
-      if constexpr (M <= 2) {
-        // Dense: every token for every item, straight-line; ks[m] is the slot of token m in the
-        // item's unit (TOPK for the shared down, -1 if not routed), and nothing is written for -1.
-        int ks[M];
+      const ItemInfo f = item_info(c, true);
 #pragma unroll
-        for (int m = 0; m < M; ++m) ks[m] = f.u < nu ? (int)s_slot[f.u][m] : TOPK;
-#pragma unroll
-        for (int j = 0; j < CB; ++j) {
-          if (!__builtin_amdgcn_readlane(f.valid, j)) break;
-          const int rl = 2 * __builtin_amdgcn_readlane(f.pl, j) + half;
-#pragma unroll
-          for (int m = 0; m < M; ++m) {
-            const int k = __builtin_amdgcn_readlane(ks[m], j);
-            const int kc = k < 0 ? 0 : (k > TOPK - 1 ? TOPK - 1 : k);
-            const uint4 av = k == TOPK ? s_sa[(m * INTER + kk) / 8] : s_actv[((m * TOPK + kc) * INTER + kk) / 8];
-            float d = 0.f;
-            dot8(buf[j], av, d);
-            d = hsum<V>(d, lane);
-            const float val = k == TOPK ? bfr(d) : bfr(d * s_w[m][kc]);
-            if (k >= 0 && (lane & 31) == 0) s_part[(m * NSLOT + k) * RMAX + rl] = val;
-          }
-        }
-      } else {
-        // Sparse: only the tokens routed to the item's expert.
-        const unsigned um = f.u < nu ? s_umask[f.u] : 0u;
-#pragma unroll
-        for (int j = 0; j < CB; ++j) {
-          if (!__builtin_amdgcn_readlane(f.valid, j)) break;
-          const int u = __builtin_amdgcn_readlane(f.u, j);
-          const int rl = 2 * __builtin_amdgcn_readlane(f.pl, j) + half;
-          if (u < nu) {
-            unsigned mask = (unsigned)__builtin_amdgcn_readlane((int)um, j);
-            while (mask) {
-              const int m = __builtin_ctz(mask);
-              mask &= mask - 1u;
-              const int k = ufirst(s_slot[u][m]);
-              float d = 0.f;
-              dot8(buf[j], s_actv[((m * TOPK + k) * INTER + kk) / 8], d);
-              d = hsum<V>(d, lane);
-              if ((lane & 31) == 0) s_part[(m * NSLOT + k) * RMAX + rl] = bfr(d * s_w[m][k]);
-            }
-          } else {
-#pragma unroll
-            for (int m = 0; m < M; ++m) {
-              float sd = 0.f;
-              dot8(buf[j], s_sa[(m * INTER + kk) / 8], sd);
-              sd = hsum<V>(sd, lane);
-              if ((lane & 31) == 0) s_part[(m * NSLOT + TOPK) * RMAX + rl] = bfr(sd);
-            }
-          }
+      for (int j = 0; j < CB; ++j) {
+        if (!__builtin_amdgcn_readlane(f.valid, j)) break;
+        const int rl = 2 * __builtin_amdgcn_readlane(f.pl, j) + half;
+        unsigned mask = (unsigned)__builtin_amdgcn_readlane(f.mask, j);
+        const unsigned kp = (unsigned)__builtin_amdgcn_readlane(f.kp, j);
+        while (mask) {
+          const int m = __builtin_ctz(mask);
+          mask &= mask - 1u;
+          const int k = (int)((kp >> (4 * m)) & 15u);
+          const bool sh = k == TOPK;
+          const uint4 av = sh ? s_sa[(m * INTER + kk) / 8] : s_actv[((m * TOPK + (k & 7)) * INTER + kk) / 8];
+          const float w = sh ? 1.0f : s_w[m][k & 7];
+          float d = 0.f;
+          dot8(buf[j], av, d);
+          d = hsum<V>(d, lane);
+          // d * 1.0f == d, so the shared term is bf16(sd) exactly as in the per-token form.
+          if ((lane & 31) == 0) s_part[(m * NSLOT + k) * RMAX + rl] = bfr(d * w);
         }
       }
     };
@@ -773,18 +756,23 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
       if (blockIdx.x == 0 && tid == 0) __hip_atomic_store(sync + S_ROUTER, 0u, __ATOMIC_RELAXED, AGENT);
       if (wave == 0) stage();
       __syncthreads();
-      if (nch > 0) load_chunk(0, bA);
-      if (nch > 1) load_chunk(1, bB);
     }
     stamp(6);
+    // Window c is computed from bA while window c + 1 loads into bB; then bB moves to bA (after
+    // its loads land, which window c + 1 needs next anyway) and window c + 2 starts loading.
+    // One compute site keeps the code small.
     for (bool first = true;; first = false) {
-      for (int c = 0; c < nch; c += 2) {
+      if (!PRE || !first) {
+        if (nch > 0) load_chunk(0, bA);
+        if (nch > 1) load_chunk(1, bB);
+      }
+      for (int c = 0; c < nch; ++c) {
         comp_chunk(c, bA);
         if (first && c == 0) stamp(7);
-        if (c + 2 < nch) load_chunk(c + 2, bA);
         if (c + 1 < nch) {
-          comp_chunk(c + 1, bB);
-          if (c + 3 < nch) load_chunk(c + 3, bB);
+#pragma unroll
+          for (int j = 0; j < CB; ++j) bA[j] = bB[j];
+          if (c + 2 < nch) load_chunk(c + 2, bB);
         }
       }
       lds_barrier();
@@ -793,8 +781,6 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
       if (b >= nblk) break;
       lds_barrier();
       set_block();
-      if (nch > 0) load_chunk(0, bA);
-      if (nch > 1) load_chunk(1, bB);
     }
     stamp(8);
   }
