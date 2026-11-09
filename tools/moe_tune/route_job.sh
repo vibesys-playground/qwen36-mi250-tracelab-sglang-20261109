@@ -21,5 +21,6 @@ if [ $ok = 1 ]; then timeout 1500 python3 -u $CK/tools/moe_tune/route_client.py 
 pkill -P $pid 2>/dev/null; kill $pid 2>/dev/null; sleep 10; pkill -9 -f "sglang.launch_server" 2>/dev/null; pkill -9 -f "sglang::" 2>/dev/null; sleep 8
 echo "dump files: $(ls /tmp/route | wc -l)"; ls /tmp/route | sed -E 's/.*_M//' | sort | uniq -c | sort -k2 -n | head -30
 tail -n 15 /tmp/srv.log
+unset SGLANG_MOE_ROUTE_DUMP_DIR
 export HIP_VISIBLE_DEVICES=0
 python3 -u $CK/tools/moe_tune/route_tune.py --dump /tmp/route
