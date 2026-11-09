@@ -198,6 +198,7 @@ VARIANTS = [  # (name, variant bits, workgroups per CU); bits in hip_decode_moe_
     ("ldsb+b2", 53, 1), ("ldsb+b2/2", 53, 2), ("ldsb+b2/3", 53, 3),
     ("ldsb+b2+w2x", 117, 1), ("ldsb+b2+w2x/2", 117, 2), ("ldsb+w2x/2", 85, 2),
 ]
+BUILT = (0, 8, 1, 5, 13, 21, 29, 37, 53, 61, 85, 117, 125)  # as "Built" in the .hip
 STAMPED = ["base", "topk+dsum", "topk+dsum/2", "ldsb", "ldsb+b2", "ldsb+b2/2", "ldsb+b2+w2x", "ldsb+b2+w2x/2"]
 # s_memrealtime advances 25 ticks per us here: j144 spans at 0.01 us/tick were 1/4 of the
 # graph time per block; the bench prints graph_us_per_block / span to keep this honest.
@@ -222,7 +223,7 @@ def variants_main():
     from sglang.kernels.ops.moe import hip_decode_moe_block as mk
 
     log("platform_ok", mk.platform_ok())
-    co = {(m, v): torch.ops.sgl_kernel.hip_decode_moe_block_max_grid(m, v) for m in (1, 2) for v in range(16)}
+    co = {(m, v): torch.ops.sgl_kernel.hip_decode_moe_block_max_grid(m, v) for m in (1, 2) for v in BUILT}
     log("co-resident grid by (M, variant):", co)
     RES["co_grid"] = {f"{m},{v}": g for (m, v), g in co.items()}
     head, route = setup_head()
@@ -259,41 +260,45 @@ def variants_main():
         if co[(2, v)] < wpc * cu and wpc > 1:
             log("skip", name, "not co-resident:", co[(2, v)])
             continue
-        c = {"grid_M1": grid_of(1, v, wpc), "grid_M2": grid_of(2, v, wpc)}
-        y8 = kern(blocks[0], x8, v, wpc).clone()
-        c["bitwise_eq_base"] = bool(torch.equal(y8, y8_base)) and all(
-            torch.equal(kern(blocks[i], xc[i], v, wpc), yc_base[i]) for i in range(4))
-        c["bitwise_eq_topk+dsum"] = bool(torch.equal(y8, y8_d)) and all(
-            torch.equal(kern(blocks[i], xc[i], v, wpc), yc_d[i]) for i in range(4))
-        errs, ids_ok = [], True
-        for i in range(4):
-            y = kern(blocks[i], xc[i], v, wpc)
+        try:
+            c = {"grid_M1": grid_of(1, v, wpc), "grid_M2": grid_of(2, v, wpc)}
+            y8 = kern(blocks[0], x8, v, wpc).clone()
+            c["bitwise_eq_base"] = bool(torch.equal(y8, y8_base)) and all(
+                torch.equal(kern(blocks[i], xc[i], v, wpc), yc_base[i]) for i in range(4))
+            c["bitwise_eq_topk+dsum"] = bool(torch.equal(y8, y8_d)) and all(
+                torch.equal(kern(blocks[i], xc[i], v, wpc), yc_d[i]) for i in range(4))
+            errs, ids_ok = [], True
+            for i in range(4):
+                y = kern(blocks[i], xc[i], v, wpc)
+                torch.cuda.synchronize()
+                ids, wts, logits = views["ids"][:2].clone(), views["wts"][:2].clone(), views["logits"][:2].clone()
+                tw, ti = route(logits.contiguous())
+                ids_ok &= bool(torch.equal(ids, ti.to(torch.int32)))
+                h = head(blocks[i], xc[i])
+                errs.append((rel_err(y, reference(blocks[i], xc[i], ids, wts)),
+                             rel_err(h["out"], reference(blocks[i], xc[i], h["ids"], h["wts"]))))
+            c["ids_equal_head_router_same_logits"] = ids_ok
+            c["relerr_kern_head"] = errs
+            c["relerr_ok"] = all(k <= max(2 * hh, 1e-2) for k, hh in errs)
+            c["repeatable_50"] = all(torch.equal(kern(blocks[0], x8, v, wpc), y8) for _ in range(50))
+            inv = {m: bool(torch.equal(kern(blocks[0], x8[:m].contiguous(), v, wpc), y8[:m])) for m in range(1, 8)}
+            inv["grid_half"] = bool(torch.equal(kern(blocks[0], x8, v, wpc, grid=cu // 2), y8))
+            c["batch_invariant"] = all(inv.values())
+            out_buf = torch.empty_like(x8)
+            g = capture(lambda: kern(blocks[0], x8, v, wpc, out=out_buf))
+            out_buf.zero_()
+            g.replay()
             torch.cuda.synchronize()
-            ids, wts, logits = views["ids"][:2].clone(), views["wts"][:2].clone(), views["logits"][:2].clone()
-            tw, ti = route(logits.contiguous())
-            ids_ok &= bool(torch.equal(ids, ti.to(torch.int32)))
-            h = head(blocks[i], xc[i])
-            errs.append((rel_err(y, reference(blocks[i], xc[i], ids, wts)),
-                         rel_err(h["out"], reference(blocks[i], xc[i], h["ids"], h["wts"]))))
-        c["ids_equal_head_router_same_logits"] = ids_ok
-        c["relerr_kern_head"] = errs
-        c["relerr_ok"] = all(k <= max(2 * hh, 1e-2) for k, hh in errs)
-        c["repeatable_50"] = all(torch.equal(kern(blocks[0], x8, v, wpc), y8) for _ in range(50))
-        inv = {m: bool(torch.equal(kern(blocks[0], x8[:m].contiguous(), v, wpc), y8[:m])) for m in range(1, 8)}
-        inv["grid_half"] = bool(torch.equal(kern(blocks[0], x8, v, wpc, grid=cu // 2), y8))
-        c["batch_invariant"] = all(inv.values())
-        out_buf = torch.empty_like(x8)
-        g = capture(lambda: kern(blocks[0], x8, v, wpc, out=out_buf))
-        out_buf.zero_()
-        g.replay()
-        torch.cuda.synchronize()
-        c["graph_equals_eager"] = bool(torch.equal(out_buf, y8))
-        del g
-        c["sync_err"] = int(views["sync"][128].item())
-        c["ok"] = (ids_ok and c["relerr_ok"] and c["repeatable_50"] and c["batch_invariant"]
-                   and c["graph_equals_eager"] and c["sync_err"] == 0)
-        ok_by[name] = c["ok"]
-        RES.setdefault("checks", {})[name] = c
+            c["graph_equals_eager"] = bool(torch.equal(out_buf, y8))
+            del g
+            c["sync_err"] = int(views["sync"][128].item())
+            c["ok"] = (ids_ok and c["relerr_ok"] and c["repeatable_50"] and c["batch_invariant"]
+                       and c["graph_equals_eager"] and c["sync_err"] == 0)
+            ok_by[name] = c["ok"]
+            RES.setdefault("checks", {})[name] = c
+        except Exception:  # noqa: BLE001
+            log("check failed", name, traceback.format_exc()[-1500:])
+            continue
         log("check", name, f"v={v} wpc={wpc}", c)
 
     # ---- timing: graph replay per block, M = 1, 2, 4; three interleaved repeats
@@ -322,7 +327,7 @@ def variants_main():
             ts = tim[(n, M)]
             row[f"M{M}_us"] = round(min(ts), 2)
             row[f"M{M}_reps"] = [round(t, 2) for t in ts]
-            row[f"M{M}_TBps"] = round(mb[M] / min(ts) / 1e6, 3)
+            row[f"M{M}_TBps"] = round(mb[M] / min(ts), 3)  # MB / us = TB/s
         table.append(row)
         log("timing", row)
     RES["timing"] = table
@@ -337,24 +342,27 @@ def variants_main():
         vs = v | 8
         if co[(2, vs)] < w * cu and w > 1:
             continue
-        for M in (1, 2):
-            xs = xs_by_m[M]
-            outs = [torch.empty_like(x) for x in xs]
-            G = grid_of(M, vs, w)
-            g = capture(lambda: [kern(L, x, vs, w, out=o) for L, x, o in zip(blocks, xs, outs)])
-            rows = []
-            for _ in range(30):
-                g.replay()
-                torch.cuda.synchronize()
-                rows.append(phases(views["stamps"].clone(), min(G, 256)))
-            t_graph = ev_time(g.replay, 20) / NLAYERS
-            del g
-            agg = {k: round(sorted(r[k] for r in rows)[len(rows) // 2], 2) for k in rows[0]}
-            agg["graph_us_per_block"] = round(t_graph, 2)
-            agg["grid"] = G
-            agg["graph_over_span"] = round(t_graph / max(agg["span"], 1e-6), 3)
-            ph[f"{n} M={M}"] = agg
-            log("phases", n, f"M={M}", agg)
+        try:
+            for M in (1, 2):
+                xs = xs_by_m[M]
+                outs = [torch.empty_like(x) for x in xs]
+                G = grid_of(M, vs, w)
+                g = capture(lambda: [kern(L, x, vs, w, out=o) for L, x, o in zip(blocks, xs, outs)])
+                rows = []
+                for _ in range(30):
+                    g.replay()
+                    torch.cuda.synchronize()
+                    rows.append(phases(views["stamps"].clone(), min(G, 256)))
+                t_graph = ev_time(g.replay, 20) / NLAYERS
+                del g
+                agg = {k: round(sorted(r[k] for r in rows)[len(rows) // 2], 2) for k in rows[0]}
+                agg["graph_us_per_block"] = round(t_graph, 2)
+                agg["grid"] = G
+                agg["graph_over_span"] = round(t_graph / max(agg["span"], 1e-6), 3)
+                ph[f"{n} M={M}"] = agg
+                log("phases", n, f"M={M}", agg)
+        except Exception:  # noqa: BLE001
+            log("phases failed", n, traceback.format_exc()[-1500:])
     RES["phases"] = ph
 
     good = [r for r in table if r["variant"] != "new_head" and ok_by.get(r["variant"])]
