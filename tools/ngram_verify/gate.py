@@ -49,17 +49,25 @@ BASE_FLAGS = [
     "--cuda-graph-backend-prefill", "breakable", "--cuda-graph-max-bs-prefill", "2816",
     "--enable-cache-report", "--mamba-track-interval", "64",
     "--default-chat-template-kwargs", '{"enable_thinking": false}',
-    "--max-running-requests", "8", "--cuda-graph-max-bs-decode", "8",
+    "--max-running-requests", "8", "--cuda-graph-max-bs-decode", "8", "--enable-metrics",
 ]
 SPEC = ["--speculative-algorithm", "NGRAM", "--speculative-ngram-max-bfs-breadth", "1"]
 SPEC_ENV = {"SGLANG_NGRAM_PROMPT_LOOKUP": "1", "SGLANG_NGRAM_DECODE_VERIFY": "1"}
 K2 = SPEC + ["--speculative-num-draft-tokens", "3"]
+NOOVL = ["--disable-overlap-schedule"]
 VARIANTS = {
     "nospec": ([], {}),
     "k2": (K2, dict(SPEC_ENV)),
     "k2c": (K2, dict(SPEC_ENV, SGLANG_SPEC_DEBUG_CORRUPT_DRAFT_PCT="30")),
     "k2fixed": (K2, dict(SPEC_ENV, SGLANG_NGRAM_ADAPTIVE_WIDTH="0")),
+    "k2_noovl": (K2 + NOOVL, dict(SPEC_ENV)),
+    "k2fixed_noovl": (K2 + NOOVL, dict(SPEC_ENV, SGLANG_NGRAM_ADAPTIVE_WIDTH="0")),
+    "nospec2": ([], {}),
 }
+# Phase 1 is the exactness gate; phase 2 adds the overlap-off variants (exactness at
+# bs=1 and pair) and a second nospec as the replay timing noise floor.
+PHASES = [["nospec", "k2", "k2c", "k2fixed"], ["k2_noovl", "k2fixed_noovl", "nospec2"]]
+FULL = {"nospec", "k2", "k2c", "k2fixed"}
 
 
 def log(*a):
@@ -136,7 +144,7 @@ async def run_client(name, url, prompts, logfile):
         async def flush():
             await client.post(url + "/flush_cache")
 
-        for rep in (1, 2, 3):
+        for rep in ((1, 2, 3) if name in FULL else (1,)):
             outs = []
             for p in prompts:
                 await flush()
@@ -158,6 +166,9 @@ async def run_client(name, url, prompts, logfile):
                 outs[i + j] = o
         res["pair2"] = outs
         await flush()
+        if name not in FULL:
+            res["stream"] = [await stream(client, url, p) for p in prompts[:4] + prompts[8:10]]
+            return res
         res["conc"] = [o for o, _ in await asyncio.gather(*(generate(client, url, p) for p in prompts))]
         res["kept"] = [(await generate(client, url, p))[0] for p in prompts]
         log(f"[{name}] pair/conc/kept done")
@@ -192,6 +203,8 @@ def compare(results, prompts, logs):
             lines.append(f"{name}: NO RESULT")
             continue
         for mode in ("seq1", "seq2", "seq3", "pair", "pair2", "conc", "kept"):
+            if mode not in r:
+                continue
             ref = base["seq1"] if base else None
             diffs = []
             for i, p in enumerate(prompts):
@@ -204,6 +217,8 @@ def compare(results, prompts, logs):
     lines.append("--- repeatability within a variant (seq1/seq2/seq3 identical; pair/conc vs nospec's own pair/conc) ---")
     for name, r in results.items():
         if r is None:
+            continue
+        if "seq2" not in r:
             continue
         rep = all(r["seq1"][i] == r["seq2"][i] == r["seq3"][i] for i in range(len(prompts)))
         pc = ""
@@ -220,7 +235,7 @@ def compare(results, prompts, logs):
 
     if base:
         lines.append(f"noise floor: nospec pair vs nospec pair2 {same(base['pair'], base['pair2'])}/{n}")
-    for name in ("k2", "k2fixed"):
+    for name in ("k2", "k2fixed", "k2_noovl", "k2fixed_noovl"):
         r, c = results.get(name), results.get("k2c")
         if r:
             lines.append(f"{name} pair vs pair2 {same(r['pair'], r['pair2'])}/{n}"
@@ -243,6 +258,10 @@ def compare(results, prompts, logs):
             same = "n/a" if not ref else str(s["ids"] == ref["stream"][k]["ids"])
             lines.append(f"{name:7s} {p['name']:6s} {'OK  ' if ok else 'FAIL'} ids==nospec.stream {same} ids={len(s['ids'])} usage={u.get('completion_tokens')} "
                          f"prompt_tokens={u.get('prompt_tokens')} chunks={len(s['chunks'])} max_chunk={max(s['chunks'] or [0])} restated={s['restated']} finish={s['finish']}")
+    lines.append("=== replay (full trace, 2 sessions per server, one pass): TTFT breakdown in ms ===")
+    for name, r in results.items():
+        if r is not None and r.get("replay"):
+            lines.append(r["replay"])
     lines.append("=== speed (wall tok/s, 512 new tokens) ===")
     for name, r in results.items():
         if r is not None:
@@ -305,7 +324,16 @@ async def _one_variant(name, gpus, port, prompts, extra):
         if not ok:
             log(f"[{name}] server log tail:\n" + "".join(open(logf, errors="replace").readlines()[-60:]))
             return "not_ready"
-        return await run_client(name, url, prompts, logf)
+        res = await run_client(name, url, prompts, logf)
+        if name != "k2c" and POOL:
+            from ttft_probe import replay, summarize
+
+            async with httpx.AsyncClient() as c:
+                await c.post(url + "/flush_cache")
+            recs, rate = await replay(name, url, POOL[0], 100)
+            res["replay"] = summarize(name, recs, rate)
+            log(res["replay"])
+        return res
     except Exception as e:  # noqa: BLE001
         log(f"[{name}] client error {type(e).__name__}: {e}")
         log(f"[{name}] server log tail:\n" + "".join(open(logf, errors="replace").readlines()[-60:]))
@@ -321,18 +349,26 @@ async def _one_variant(name, gpus, port, prompts, extra):
                 pass
 
 
+POOL = []
+
+
 async def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    names = sys.argv[1].split(",") if len(sys.argv) > 1 else list(VARIANTS)
     unit = subprocess.run([sys.executable, str(HERE / "unit_gpu_drafts.py")], cwd="/",
                           env=dict(os.environ, HIP_VISIBLE_DEVICES="0"),
                           capture_output=True, text=True, timeout=1800)
     log("=== unit: GPU drafts vs host drafts ===\n" + unit.stdout[-4000:] + unit.stderr[-3000:])
     prompts = build_prompts()
     log("prompts:", [(p["name"], len(p["ids"]), p["max"]) for p in prompts])
+    from ttft_probe import build_pool
+
+    POOL.append(build_pool("a1b2c3d4e5f60718293a4b5c6d7e8f90"))
     gpus = ["0,1", "2,3", "4,5", "6,7"]
-    rs = await asyncio.gather(*(one_variant(n, gpus[i], 31100 + 10 * i, prompts) for i, n in enumerate(names)))
-    results = dict(zip(names, rs))
+    results = {}
+    for names in PHASES:
+        rs = await asyncio.gather(*(one_variant(n, gpus[i], 31100 + 10 * i, prompts) for i, n in enumerate(names)))
+        results.update(zip(names, rs))
+    names = [n for ph in PHASES for n in ph]
     json.dump(results, open(OUT / "results.json", "w"))
     log(compare(results, prompts, {n: OUT / f"server_{n}.log" for n in names}))
     return 0
