@@ -5,6 +5,7 @@ context grows by 1..W accepted tokens; the host drafter sees the committed ids p
 pending ones, the device drafter sees its history row plus the step's accept row, with
 the committed/pending split varied (result processed or not, appends repeated). Drafts
 must agree exactly for T = W and T = 1."""
+import os
 import random
 import sys
 
@@ -34,7 +35,7 @@ class Info:
 
 
 def main():
-    dev = "cuda"
+    dev = os.environ.get("P27_DEV", "cuda")
     W = 3
     rng = random.Random(7)
     fails = 0
@@ -79,7 +80,8 @@ def main():
             seq_lens = torch.tensor([x - 1 for x in L], dtype=torch.int64, device=dev)
             rpi = torch.tensor(slots, dtype=torch.int64, device=dev)
             gpu.draft(reqs, rpi, slots, seq_lens, Info(acc_tok.flatten().to(dev), acc_len.to(dev)), out, T)
-            torch.cuda.synchronize()
+            if dev != "cpu":
+                torch.cuda.synchronize()
             got = out.view(nreq, T).cpu().numpy()
             for i, r in enumerate(reqs):
                 ref = (cpu if T == W else cpu1).draft(r, np.asarray(pend[i], dtype=np.int64))

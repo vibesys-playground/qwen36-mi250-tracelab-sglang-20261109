@@ -258,6 +258,29 @@ def adaptive_draft_enabled() -> bool:
 
 
 @triton.jit
+def _lookup_match(row, L, start, N: tl.constexpr, BLOCK: tl.constexpr):
+    """Where the continuation starts after the most recent i in [start, L - N) with
+    row[i : i + N] == row[L - N : L], or -1."""
+    found = L * 0 - 1
+    if L - 1 >= N:
+        hi = L - N
+        while hi > start:
+            lo = tl.maximum(hi - BLOCK, start)
+            offs = lo + tl.arange(0, BLOCK)
+            ok = offs < hi
+            for j in tl.static_range(N):
+                p = tl.load(row + (L - N + j))
+                ok = ok & (tl.load(row + offs + j, mask=offs < hi, other=-1) == p)
+            best = tl.max(tl.where(ok, offs, -1), axis=0)
+            if best >= 0:
+                found = best + N
+                hi = start
+            else:
+                hi = lo
+    return found
+
+
+@triton.jit
 def _lookup_draft_kernel(
     hist,
     hist_stride,
@@ -301,25 +324,11 @@ def _lookup_draft_kernel(
     found = L * 0 - 1
     matched = found * 0
     for nn in tl.static_range(MAX_N - MIN_N + 1):
-        n: tl.constexpr = MAX_N - nn
         if found < 0:
-            if L - 1 >= n:
-                end = L - n  # candidate starts i in [start, end)
-                hi = end
-                while hi > start:
-                    lo = tl.maximum(hi - BLOCK, start)
-                    offs = lo + tl.arange(0, BLOCK)
-                    ok = offs < hi
-                    for j in tl.static_range(n):
-                        p = tl.load(row + (L - n + j))
-                        ok = ok & (tl.load(row + offs + j, mask=offs < hi, other=-1) == p)
-                    best = tl.max(tl.where(ok, offs, -1), axis=0)
-                    if best >= 0:
-                        found = best + n
-                        matched = matched * 0 + n
-                        hi = start  # stop
-                    else:
-                        hi = lo
+            f = _lookup_match(row, L, start, MAX_N - nn, BLOCK)
+            if f >= 0:
+                found = f
+                matched = matched * 0 + (MAX_N - nn)
     out = drafts + i * T_OUT
     tl.store(out, last.to(tl.int64))
     period = tl.maximum(L - found, 1)
