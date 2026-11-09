@@ -68,6 +68,27 @@ class F2Config(NamedTuple):
     stag: int = 0
 
 
+class P2pArgs(ctypes.Structure):
+    """skinny_gemv_gfx90a.hip's P2pArgs (the TP=2 P2P boundary kernels' arguments)."""
+
+    _fields_ = [
+        ("yloc", ctypes.c_void_p),
+        ("peer", ctypes.c_void_p),
+        ("mine", ctypes.c_void_p),
+        ("ctl", ctypes.c_void_p),
+        ("inp", ctypes.c_void_p),
+        ("residual", ctypes.c_void_p),
+        ("weight", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("res_out", ctypes.c_void_p),
+        ("eps", ctypes.c_float),
+        ("rank", ctypes.c_int),
+        ("n", ctypes.c_int),
+        ("rows", ctypes.c_int),
+        ("in_stride", ctypes.c_int),
+    ]
+
+
 def _cache_dir() -> str:
     d = os.environ.get("SGLANG_SKINNY_GEMV_CACHE")
     if not d:
@@ -105,6 +126,19 @@ class GemvLib:
         lib.skf2_entry.argtypes = [ci, ctypes.POINTER(ci)]
         lib.skf2_find.argtypes = [ci] * 7
         lib.skf2_launch.argtypes = [ci, vp, vp, vp, vp, ci, ci, ci, ci, ci, vp]
+        # TP=2 P2P boundary kernels (skf2ar, p2p_ar_norm, p2p_gather); see P2pArgs.
+        lib.skp_args_size.restype = ci
+        lib.skp_alloc_uncached.argtypes = [ctypes.c_size_t]
+        lib.skp_alloc_uncached.restype = vp
+        lib.skp_ipc_handle.argtypes = [vp, ctypes.c_char_p]
+        lib.skp_ipc_open.argtypes = [ctypes.c_char_p]
+        lib.skp_ipc_open.restype = vp
+        pa = ctypes.POINTER(P2pArgs)
+        lib.skf2ar_launch.argtypes = [vp, vp, ci, ci, pa, vp]
+        lib.skp_ar_norm_launch.argtypes = [ci, pa, vp]
+        lib.skp_gather_launch.argtypes = [ci, ci, pa, vp]
+        if lib.skp_args_size() != ctypes.sizeof(P2pArgs):
+            raise RuntimeError("P2pArgs layout mismatch")
         self.lib = lib
         self.path = path
         self.entries = []

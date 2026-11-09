@@ -86,6 +86,53 @@ if _use_aiter_lm_head:
     from aiter.tuned_gemm import tgemm
 
 
+# gfx90a TP=2 decode: the lm_head on the HIP skinny GEMV and the logits gather over P2P
+# (layer_boundary/fusions/hip_p2p.py). Each part has its own switch.
+_hip_decode_tail = (
+    is_hip()
+    and not envs.SGLANG_USE_AITER.get()
+    and torch.cuda.is_available()
+    and "gfx90a" in torch.cuda.get_device_properties(0).gcnArchName
+)
+
+
+def _hip_skinny_lm_head_ok(
+    hidden_states: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor]
+) -> bool:
+    if not (
+        _hip_decode_tail
+        and out is None
+        and hidden_states.dim() == 2
+        and 0 < hidden_states.shape[0] <= 16
+        and hidden_states.dtype == weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and weight.is_contiguous()
+        and envs.SGLANG_HIP_DECODE_BOUNDARY_FUSION.get()
+        and envs.SGLANG_HIP_SKINNY_LM_HEAD.get()
+    ):
+        return False
+    from sglang.kernels.ops.gemm import skinny_gemm_hip
+
+    return skinny_gemm_hip.gemv_active(weight.shape[0], weight.shape[1])
+
+
+def _hip_p2p_gather(logits: torch.Tensor) -> Optional[torch.Tensor]:
+    """The TP=2 column gather over P2P, or None when it does not take these logits."""
+    if not (
+        _hip_decode_tail
+        and envs.SGLANG_HIP_DECODE_BOUNDARY_FUSION.get()
+        and envs.SGLANG_HIP_P2P_LOGITS_GATHER.get()
+        and get_parallel().tp_size == 2
+    ):
+        return None
+    from sglang.srt.layers.layer_boundary.fusions.hip_p2p import hip_p2p
+
+    p2p = hip_p2p()
+    if p2p is None or not p2p.gather_fits(logits):
+        return None
+    return p2p.gather(logits)
+
+
 def _aiter_lm_head_ok(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
     return (
         _use_aiter_lm_head
@@ -1257,7 +1304,10 @@ class LogitsProcessor(nn.Module):
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
             else:
-                logits = self._logits_gatherer(logits)
+                gathered = _hip_p2p_gather(logits)
+                logits = (
+                    gathered if gathered is not None else self._logits_gatherer(logits)
+                )
             _trace_e2e_logits(
                 "tp_logits_gather_returned", logits_shape=tuple(logits.shape)
             )
@@ -1421,6 +1471,10 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
+            elif _hip_skinny_lm_head_ok(hidden_states, lm_head.weight, out):
+                from sglang.kernels.ops.gemm import skinny_gemm_hip
+
+                logits = skinny_gemm_hip.skinny_linear(hidden_states, lm_head.weight, None)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
                 if out is not None and out.dtype == lm_head.weight.dtype:
