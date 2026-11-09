@@ -15,7 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -247,7 +247,29 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
         from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
+    if _is_hip_gfx90a:
+        from sglang.srt.layers.layer_boundary.fusions.hip_p2p import hip_p2p_fusion
+
+        return hip_p2p_fusion(is_nextn)
     return None
+
+
+def _run_attention(fusion, attention, forward_batch, hs, norm, weight, run):
+    """Run the attention; with a P2P fusion that takes its output projection (gfx90a TP=2
+    decode), the attention returns the projection's input and the FFN-input fusion runs
+    the projection together with the all-reduce, residual add and norm."""
+    deferred = fusion is not None and fusion.defers_out_proj(forward_batch, hs, norm, weight)
+    if not deferred:
+        return run(), False
+    from sglang.srt.layers.layer_boundary.fusions.hip_p2p import mark_deferred
+
+    attention.defer_out_proj = True
+    try:
+        out = run()
+    finally:
+        attention.defer_out_proj = False
+    mark_deferred(out, weight)
+    return out, True
 
 
 def _qwen3_5_is_moe(config: Qwen3_5TextConfig) -> bool:
@@ -527,6 +549,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+        # Set by the decoder layer around one call: return out_proj's input instead.
+        self.defer_out_proj = False
 
         if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
@@ -1161,6 +1185,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             *core_attn_out.shape[:-2],
             core_attn_out.shape[-2] * core_attn_out.shape[-1],
         )
+        if self.defer_out_proj:
+            return core_attn_out
 
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -1230,6 +1256,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # it. Otherwise, stay on the plain AR+RMSNorm path.
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         boundary_fusions = _layer_fusions(config, is_nextn)
+        self._p2p_fusion = boundary_fusions if _is_hip_gfx90a else None
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
             attn, ffn = self.stage_facts(
@@ -1259,15 +1286,25 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        deferred = False
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
-            hidden_states = self.linear_attn(
-                hidden_states,
+            hidden_states, deferred = _run_attention(
+                self._p2p_fusion,
+                self.linear_attn,
                 forward_batch,
+                hs,
+                self.post_attention_layernorm,
+                self.linear_attn.out_proj.weight,
+                partial(self.linear_attn, hidden_states, forward_batch),
             )
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if deferred:
+            from sglang.srt.layers.layer_boundary.fusions.hip_p2p import check_consumed
+
+            check_consumed()
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
@@ -1397,6 +1434,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
+        # Set by forward around one call: self_attention returns o_proj's input instead.
+        self.defer_out_proj = False
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -1456,6 +1495,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # when qkv_proj can consume the returned quantized tuple.
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
         boundary_fusions = _layer_fusions(config, is_nextn)
+        self._p2p_fusion = boundary_fusions if _is_hip_gfx90a else None
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
             attn, ffn = self.stage_facts(
@@ -1688,6 +1728,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
 
+        if self.defer_out_proj:
+            return attn_output.reshape(-1, attn_output.shape[-1])
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1707,16 +1749,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        deferred = False
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+            hidden_states, deferred = _run_attention(
+                self._p2p_fusion,
+                self,
+                forward_batch,
+                hs,
+                self.post_attention_layernorm,
+                self.o_proj.weight,
+                partial(
+                    self.self_attention,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                ),
             )
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if deferred:
+            from sglang.srt.layers.layer_boundary.fusions.hip_p2p import check_consumed
+
+            check_consumed()
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(

@@ -1121,6 +1121,15 @@ class Envs:
     # One-launch decode MoE block on gfx90a for BF16 Qwen3.5/3.6-MoE at decode M <= 4
     # (kernels/aot/csrc/moe/hip_decode_moe_block.hip). Set to 0 to use the per-op path.
     SGLANG_HIP_DECODE_MEGAKERNEL = EnvBool(True)
+    # gfx90a TP=2 decode boundaries over P2P (kernels/ops/gemm/skinny_p2p_hip.py). The first
+    # switches all of them; each part has its own: the out_proj/o_proj GEMV with the
+    # all-reduce + add + norm epilogue (A), the P2P all-reduce + add + norm kernel at the other
+    # boundaries (B), the lm_head on the HIP GEMV and the P2P logits gather (C).
+    SGLANG_HIP_DECODE_BOUNDARY_FUSION = EnvBool(True)
+    SGLANG_HIP_P2P_OUT_PROJ_NORM = EnvBool(True)
+    SGLANG_HIP_P2P_AR_NORM = EnvBool(True)
+    SGLANG_HIP_SKINNY_LM_HEAD = EnvBool(True)
+    SGLANG_HIP_P2P_LOGITS_GATHER = EnvBool(True)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.

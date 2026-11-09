@@ -338,6 +338,9 @@ _GEMV_TUNED: dict[tuple[int, int], tuple[str, object]] = {
     (256, 2048): ("f2", _gemv.F2Config(1, 8, 1)),  # 6.4/6.9 -> 3.4/5.8
     (512, 2048): ("f2", _gemv.F2Config(2, 8, 1)),  # 6.9/9.0 -> 4.5/6.8
     (2048, 256): ("q", _gemv.MfmaConfig(1, 4, 1, 0)),  # f2 over +5% at M = 16
+    # Qwen3.5/3.6 lm_head shard at TP=2 (logits_processor calls skinny_linear directly; the
+    # generic path stops at _MAX_N). PLACEHOLDER until tools/decode_boundary picks a config.
+    (124160, 2048): ("f2", _gemv.F2Config(4, 16, 1)),
 }
 
 _gemv_lib: Optional[_gemv.GemvLib] = None
