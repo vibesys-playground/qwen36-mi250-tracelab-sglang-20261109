@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -442,6 +443,25 @@ def _moe_support_tma():
     return support_tensor_descriptor()
 
 
+_ROUTE_DUMP_DIR = os.environ.get("SGLANG_MOE_ROUTE_DUMP_DIR")  # debug only, off by default
+_route_dump_n = 0
+
+
+def _dump_route(topk_ids: torch.Tensor):
+    """Debug: save the (num_tokens, top_k) expert ids of eager prefill calls (>= 128 tokens)."""
+    global _route_dump_n
+    if topk_ids.shape[0] < 128 or torch.cuda.is_current_stream_capturing():
+        return
+    import numpy as _np
+
+    os.makedirs(_ROUTE_DUMP_DIR, exist_ok=True)
+    _route_dump_n += 1
+    _np.save(
+        f"{_ROUTE_DUMP_DIR}/p{os.getpid()}_n{_route_dump_n:07d}_M{topk_ids.shape[0]}.npy",
+        topk_ids.to(torch.int16).cpu().numpy(),
+    )
+
+
 def _prepare_fused_moe_run(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -460,6 +480,8 @@ def _prepare_fused_moe_run(
     Shared by ``fused_experts_impl`` and ``pre_permute_standard_to_triton`` so
     both paths compute alignment from the same source.
     """
+    if _ROUTE_DUMP_DIR:
+        _dump_route(topk_ids)
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
