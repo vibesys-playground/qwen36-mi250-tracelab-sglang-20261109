@@ -111,6 +111,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.speculative.decode_verify import decode_shaped_verify
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
@@ -2020,6 +2021,26 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     @torch.no_grad()
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        # A chain verify batch runs the layer stack as a bs*T-row decode batch.
+        with decode_shaped_verify(forward_batch):
+            return self._forward_layers(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds=input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+                input_deepstack_embeds=input_deepstack_embeds,
+            )
+
+    def _forward_layers(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,

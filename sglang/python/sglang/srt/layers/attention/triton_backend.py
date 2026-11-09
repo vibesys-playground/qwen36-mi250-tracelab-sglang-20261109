@@ -44,6 +44,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.speculative.decode_verify import (
+    decode_verify_enabled,
+    dsv_num_kv_splits,
+    dsv_rows,
+)
 from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -415,6 +420,20 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+        # Decode-shaped chain verify (speculative/decode_verify.py): a verify batch
+        # gets decode metadata for its bs*T rows.
+        self.decode_verify = (
+            decode_verify_enabled()
+            and not self.is_draft_runner
+            and self.topk <= 1
+            and self.num_draft_tokens is not None
+            and self.num_draft_tokens > 1
+            and self.dcp_size == 1
+            and not self.use_mla
+            and (self.sliding_window_size is None or self.sliding_window_size <= 0)
+            and not self.runner_ids.is_translating
+        )
+        self.decode_verify_kv_indptr = None
 
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
@@ -1018,6 +1037,9 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
+        elif forward_batch.forward_mode.is_target_verify() and self.decode_verify:
+            self.forward_metadata = self._decode_verify_metadata_eager(forward_batch)
+            return
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
@@ -1282,6 +1304,11 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.decode_verify:
+            self.decode_verify_kv_indptr = torch.zeros(
+                (max_num_tokens + 1,), dtype=torch.int32, device=self.device
+            )
+
         if self.use_sliding_window_kv_pool:
             # SWA write-target buffer; refilled at replay from out_cache_loc.
             self.cuda_graph_swa_out_cache_loc = torch.zeros(
@@ -1330,6 +1357,23 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Lp=self.cuda_graph_lean_Lp,
                 lean_Op=self.cuda_graph_lean_Op,
                 lean_locks=self.cuda_graph_lean_locks,
+                uneven_batch=self.cuda_graph_uneven_batch,
+            )
+        elif forward_mode.is_target_verify() and self.decode_verify:
+            T = self._target_verify_num_tokens_per_req(spec_info)
+            return self._decode_verify_forward_metadata(
+                num_kv_splits=self.cuda_graph_num_kv_splits,
+                kv_indptr=self.decode_verify_kv_indptr[: bs * T + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                attn_logits=self.cuda_graph_attn_logits,
+                attn_lse=self.cuda_graph_attn_lse,
+                swa_attn_logits=self.cuda_graph_swa_attn_logits,
+                lean=(
+                    self.cuda_graph_lean_Mp,
+                    self.cuda_graph_lean_Lp,
+                    self.cuda_graph_lean_Op,
+                    self.cuda_graph_lean_locks,
+                ),
                 uneven_batch=self.cuda_graph_uneven_batch,
             )
         elif forward_mode.is_target_verify():
@@ -1435,6 +1479,18 @@ class TritonAttnBackend(AttentionBackend):
                 self.get_num_kv_splits(
                     self.cuda_graph_window_num_kv_splits[:bs], window_kv_lens[:bs]
                 )
+        elif forward_mode.is_target_verify() and self.decode_verify:
+            bs = len(req_pool_indices)
+            self._fill_decode_verify_rows(
+                plan=plan,
+                bs=bs,
+                T=self._target_verify_num_tokens_per_req(spec_info),
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                kv_indptr=self.decode_verify_kv_indptr,
+                kv_indices=self.cuda_graph_kv_indices,
+                num_kv_splits=self.cuda_graph_num_kv_splits,
+            )
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             self._update_target_verify_buffers(
@@ -1453,6 +1509,120 @@ class TritonAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    def _fill_decode_verify_rows(
+        self,
+        *,
+        plan: IterationIds,
+        bs: int,
+        T: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        num_kv_splits: torch.Tensor,
+    ) -> None:
+        """Decode rows of a chain verify: row n*T+t reads its request's first
+        seq_len+t+1 KV ids (the verify tokens' ids are in req_to_token already) and
+        gets the split count a decode step of column t would give it."""
+        row_lens, row_reqs = dsv_rows(seq_lens, req_pool_indices, bs, T)
+        kv_indptr[1 : bs * T + 1] = torch.cumsum(row_lens, dim=0)
+        self.runner_ids.pack_read_stream(
+            plan,
+            req_pool_indices=row_reqs,
+            seq_lens=row_lens.to(torch.int32),
+            indptr=kv_indptr[: bs * T + 1],
+            out=kv_indices,
+        )
+        dsv_num_kv_splits(self, num_kv_splits, seq_lens[:bs], bs, T)
+
+    def _decode_verify_forward_metadata(
+        self,
+        *,
+        num_kv_splits,
+        kv_indptr,
+        kv_indices,
+        attn_logits,
+        attn_lse,
+        swa_attn_logits,
+        lean,
+        uneven_batch,
+    ) -> ForwardMetadata:
+        return ForwardMetadata(
+            attn_logits=attn_logits,
+            attn_lse=attn_lse,
+            max_extend_len=None,
+            num_kv_splits=num_kv_splits,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            qo_indptr=None,
+            custom_mask=None,
+            mask_indptr=None,
+            window_kv_indptr=None,
+            window_kv_indices=None,
+            window_num_kv_splits=None,
+            window_kv_offsets=None,
+            swa_attn_logits=swa_attn_logits,
+            swa_out_cache_loc=None,
+            lean_Mp=lean[0],
+            lean_Lp=lean[1],
+            lean_Op=lean[2],
+            lean_locks=lean[3],
+            uneven_batch=uneven_batch,
+        )
+
+    def _decode_verify_metadata_eager(self, forward_batch: ForwardBatch):
+        bs = len(forward_batch.req_pool_indices)
+        T = self._target_verify_num_tokens_per_req(forward_batch.spec_info)
+        rows = bs * T
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is None:
+            seq_lens_sum = bs * self.max_context_len
+        kv_indices = torch.empty(
+            T * seq_lens_sum + rows * T, dtype=torch.int64, device=self.device
+        )
+        kv_indptr = torch.zeros((rows + 1,), dtype=torch.int32, device=self.device)
+        num_kv_splits = torch.empty((rows,), dtype=torch.int32, device=self.device)
+        self._fill_decode_verify_rows(
+            plan=forward_batch.iteration_ids,
+            bs=bs,
+            T=T,
+            seq_lens=forward_batch.seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            num_kv_splits=num_kv_splits,
+        )
+        f32 = dict(dtype=torch.float32, device=self.device)
+        attn_logits = torch.empty(
+            (rows, self.num_head, self.max_kv_splits, self.v_head_dim), **f32
+        )
+        swa_attn_logits = None
+        if self.swa_v_head_dim is not None:
+            swa_attn_logits = torch.empty(
+                (rows, self.num_head, self.max_kv_splits, self.swa_v_head_dim), **f32
+            )
+        attn_lse = torch.empty((rows, self.num_head, self.max_kv_splits), **f32)
+        lean = (
+            torch.empty((self.lean_total_programs, self.lean_block_m), **f32),
+            torch.empty((self.lean_total_programs, self.lean_block_m), **f32),
+            torch.empty(
+                (self.lean_total_programs, self.lean_block_m, self.v_head_dim), **f32
+            ),
+            torch.zeros(
+                (self.lean_total_programs,), dtype=torch.int32, device=self.device
+            ),
+        )
+        return self._decode_verify_forward_metadata(
+            num_kv_splits=num_kv_splits,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            attn_logits=attn_logits,
+            attn_lse=attn_lse,
+            swa_attn_logits=swa_attn_logits,
+            lean=lean,
+            uneven_batch=torch.zeros((1,), dtype=torch.int32, device=self.device),
+        )
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
