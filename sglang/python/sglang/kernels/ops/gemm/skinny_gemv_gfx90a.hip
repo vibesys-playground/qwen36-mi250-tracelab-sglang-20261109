@@ -586,7 +586,8 @@ static const int kFTableLen = 0;
 // order of the sum of squares differs from Triton's: a fixed tree (4 per thread in order, a
 // 64-lane xor butterfly, then the waves in order), the same for every row whatever M is.
 
-#define SKP_SPIN_MAX (1 << 26)
+// Long enough for a peer that is still JIT-compiling a kernel; the custom AR spins forever.
+#define SKP_SPIN_MAX (1 << 30)
 #define SKP_CNT 64
 #define SKP_ERR 128
 
