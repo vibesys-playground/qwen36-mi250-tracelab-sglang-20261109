@@ -254,7 +254,7 @@ def gdn_part(lib):
         L["ssm"].copy_(s[1])
 
     idx_all = torch.tensor([3, 5, 1, 6], dtype=torch.int32, device=dev)
-    sync = ws[:1024].view(torch.int32)
+    sync = ws[:4096].view(torch.int32)
 
     # ---- correctness
     corr = []
@@ -554,7 +554,8 @@ def main():
         log("GDN part failed:", traceback.format_exc()[-3000:])
         RES["gdn_error"] = traceback.format_exc()[-3000:]
     try:
-        ar_part(so)
+        if os.environ.get("SKIP_AR") != "1":
+            ar_part(so)
     except Exception:  # noqa: BLE001
         log("AR part failed:", traceback.format_exc()[-3000:])
     t2 = next((r for r in RES.get("timing", []) if r["M"] == 2), None)
