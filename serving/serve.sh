@@ -47,6 +47,8 @@ fi
 #   The overlap scheduler is off: with it on, a new request's prefill queues behind the longer
 #   verify step and TTFT p50 rises ~9 ms; with it off, TTFT matches the non-speculative head
 #   (full-trace replay at 2 sessions, plan 27 stage 2: 269 vs 234 tok/s, TTFT p50 85.3 vs 85.3 ms).
+#   Without overlap the auto Mamba radix strategy falls back to no_buffer, which caches no
+#   prefix for a repeated prompt; extra_buffer is set explicitly to keep the head's caching.
 export SGLANG_NGRAM_PROMPT_LOOKUP=1
 export SGLANG_NGRAM_DECODE_VERIFY=1
 exec python3 -m sglang.launch_server "$@" \
@@ -64,4 +66,5 @@ exec python3 -m sglang.launch_server "$@" \
   --speculative-ngram-max-bfs-breadth 1 \
   --max-running-requests 8 \
   --cuda-graph-max-bs-decode 8 \
-  --disable-overlap-schedule
+  --disable-overlap-schedule \
+  --mamba-radix-cache-strategy extra_buffer
