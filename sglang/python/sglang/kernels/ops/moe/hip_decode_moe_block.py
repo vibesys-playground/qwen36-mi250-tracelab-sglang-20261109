@@ -27,18 +27,22 @@ import torch
 logger = logging.getLogger(__name__)
 
 HIDDEN, NUM_EXPERTS, INTER, TOPK, MAX_M = 2048, 256, 256, 8, 8
-# Measured with tools/megakernel/moe_block_bench.py on gfx90a (us per block, graph replay,
-# j119): M=1 40 vs 84 per-op, M=2 64 vs 107; M=4 as two M=2 launches 127 vs 147. Larger
-# batches keep the per-op path.
+# Measured with tools/megakernel/moe_block_bench.py on gfx90a (us per block, graph replay):
+# j119 (MI250 GCD, variant 0, 1 WG/CU) M=1 40 vs 84 per-op, M=2 64 vs 107; M=4 as two M=2
+# launches 127 vs 147. Larger batches keep the per-op path.
 DISPATCH_MAX_M = 4
 CHUNK_M = 2
 # Kernel variant bits (see hip_decode_moe_block.hip): 1 DPP top-8, 4 DPP wave sums, 8 phase
 # stamps (debug), 16 phase-B inputs staged in LDS, 32 two phase-B tasks per iteration, 64 two
 # w13 tasks per iteration. Only the combinations listed in the .hip ("Built") exist.
 F_TOPK, F_DSUM, F_STAMP, F_LDSB, F_B2, F_W2X = 1, 4, 8, 16, 32, 64
-DEFAULT_VARIANT = 0
+# Plan 23, j151 (MI210, same gfx90a ISA and 104 CUs as an MI250 GCD), us per block in graph
+# replay, M=1 / M=2: variant 0 at 1 WG/CU 39.4 / 62.8; DPP top-8 36.8 / 59.7; + DPP sums
+# 36.0 / 55.2; + LDS-staged phase B at 2 WG/CU (the default) 34.5 / 53.5. Two-task
+# iterations (32, 64) did not help. All bitwise repeatable, batch and grid invariant.
+DEFAULT_VARIANT = F_TOPK | F_DSUM | F_LDSB
 # Workgroups per CU in the grid, capped by what is co-resident for the variant and M.
-DEFAULT_WG_PER_CU = 1
+DEFAULT_WG_PER_CU = 2
 _WS_BYTES = 131072
 _SYNC_ERR, _SYNC_WORDS = 128, (0, 128, 192)  # int32 indices: error word; count, err, router
 _ERR_CHECK_EVERY = 256
