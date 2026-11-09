@@ -235,6 +235,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         stream_offsets = {}
         n_prev_tokens = {}
         n_prev_token_ids = {}
+        streamed_token_ids = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -371,36 +372,61 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     yield f"data: {error}\n\n"
                     break
 
-                choice_data = CompletionResponseStreamChoice(
-                    index=index,
-                    text=delta,
-                    logprobs=logprobs,
-                    finish_reason=finish_reason_type,
-                    matched_stop=(
-                        finish_reason["matched"]
-                        if finish_reason and "matched" in finish_reason
-                        else None
-                    ),
-                    token_ids=chunk_token_ids,
-                    prompt_token_ids=chunk_prompt_token_ids,
-                )
-                chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    created=created,
-                    object="text_completion",
-                    choices=[choice_data],
-                    model=request.model,
-                )
+                # Speculative decoding streams several token ids per delta. A delta
+                # that is longer than the output so far and begins by repeating all
+                # of it (e.g. [x] then [x, y]) is what clients use to detect
+                # cumulative, non-incremental streaming, so such a delta is split
+                # into one-token events. Only that case is split; the first delta
+                # and every other one are sent as they come, and all events of a
+                # split delta are written back to back.
+                token_id_parts = [chunk_token_ids]
+                if chunk_token_ids:
+                    prev_ids = streamed_token_ids.setdefault(index, [])
+                    if (
+                        prev_ids
+                        and len(chunk_token_ids) > len(prev_ids)
+                        and list(chunk_token_ids[: len(prev_ids)]) == prev_ids
+                    ):
+                        token_id_parts = [[tid] for tid in chunk_token_ids]
+                    prev_ids.extend(chunk_token_ids)
 
-                # Add usage stats if continuous_usage_stats is enabled
-                if continuous_usage_stats:
-                    chunk.usage = UsageProcessor.calculate_token_usage(
-                        prompt_tokens=prompt_tokens.get(index, 0),
-                        completion_tokens=completion_tokens.get(index, 0),
-                        reasoning_tokens=reasoning_tokens.get(index, 0),
+                last_part = len(token_id_parts) - 1
+                for part_idx, part_token_ids in enumerate(token_id_parts):
+                    is_last_part = part_idx == last_part
+                    choice_data = CompletionResponseStreamChoice(
+                        index=index,
+                        text=delta if part_idx == 0 else "",
+                        logprobs=logprobs if part_idx == 0 else None,
+                        finish_reason=finish_reason_type if is_last_part else None,
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if is_last_part
+                            and finish_reason
+                            and "matched" in finish_reason
+                            else None
+                        ),
+                        token_ids=part_token_ids,
+                        prompt_token_ids=(
+                            chunk_prompt_token_ids if part_idx == 0 else None
+                        ),
+                    )
+                    chunk = CompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=created,
+                        object="text_completion",
+                        choices=[choice_data],
+                        model=request.model,
                     )
 
-                yield f"data: {chunk.model_dump_json()}\n\n"
+                    # Add usage stats if continuous_usage_stats is enabled
+                    if continuous_usage_stats:
+                        chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens.get(index, 0),
+                            completion_tokens=completion_tokens.get(index, 0),
+                            reasoning_tokens=reasoning_tokens.get(index, 0),
+                        )
+
+                    yield f"data: {chunk.model_dump_json()}\n\n"
                 stream_started = True
 
             if request.return_hidden_states and hidden_states:
