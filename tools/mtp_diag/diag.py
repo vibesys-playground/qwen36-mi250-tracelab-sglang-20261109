@@ -285,9 +285,15 @@ def summarize_server_log(logfile: Path) -> None:
     gen = collections.defaultdict(list)
     for m in re.finditer(r"#running-req: (\d+).*?gen throughput \(token/s\): ([0-9.]+)", text):
         gen[int(m.group(1))].append(float(m.group(2)))
-    for bs in sorted(gen)[:6]:
+    for bs in sorted(gen)[:8]:
         xs = sorted(gen[bs])
         log(f"server: Decode batch running-req={bs}: n={len(xs)} gen tok/s median {xs[len(xs) // 2]:.1f}")
+    timing = collections.defaultdict(list)
+    for m in re.finditer(r"SPEC_STAGE_TIMING bs=(\d+) steps=\d+ ms/step: (.*)", text):
+        timing[int(m.group(1))].append(m.group(2))
+    for bs in sorted(timing)[:6]:
+        for entry in timing[bs][-3:]:
+            log(f"server: stage timing bs={bs}: {entry}")
     shown = 0
     for line in text.splitlines():
         if re.search(r"(?i)breakable|capture cuda graph (begin|end)|prefill.*graph|graph.*prefill", line) and shown < 12:
@@ -305,7 +311,13 @@ VARIANTS = {
     "spec-uv": (True, {"SGLANG_TRITON_UNIFIED_VERIFY": "1"}),
     "spec-uv-corrupt": (True, {"SGLANG_TRITON_UNIFIED_VERIFY": "1",
                                "SGLANG_SPEC_DEBUG_CORRUPT_DRAFT": "0.3"}),
+    # Synchronizes around draft / verify / draft-extend to split an MTP step's cost (debug
+    # timer in eagle_worker_v2); short runs only, its timings are not serving latency.
+    "spec-uv-timing": (True, {"SGLANG_TRITON_UNIFIED_VERIFY": "1",
+                              "SGLANG_SPEC_DEBUG_STAGE_TIMING": "1"}),
 }
+# Variants that only need a short run (repeats, replay rounds).
+SHORT = {"spec-uv-timing": (3, 100)}
 
 
 async def main() -> int:
@@ -314,7 +326,7 @@ async def main() -> int:
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--replay-rounds", type=int, default=303)
-    parser.add_argument("--variants", default="nospec,spec-uv,spec-uv-corrupt,spec")
+    parser.add_argument("--variants", default="nospec,spec-uv,spec-uv-corrupt,spec-uv-timing")
     args = parser.parse_args()
     root = Path.cwd()
     logdir = Path(tempfile.mkdtemp(prefix="mtp-diag-"))
@@ -335,7 +347,8 @@ async def main() -> int:
         argv = ["bash", str(script), "--model-path", MODEL, "--revision", REVISION, "--host",
                 "127.0.0.1", "--port", str(args.port), "--context-length", "262144"]
         env = {k: v for k, v in os.environ.items()
-               if k not in ("SGLANG_TRITON_UNIFIED_VERIFY", "SGLANG_SPEC_DEBUG_CORRUPT_DRAFT")}
+               if k not in ("SGLANG_TRITON_UNIFIED_VERIFY", "SGLANG_SPEC_DEBUG_CORRUPT_DRAFT",
+                            "SGLANG_SPEC_DEBUG_STAGE_TIMING")}
         env.update(env_extra)
         proc = subprocess.Popen(argv, stdout=logfile.open("w"), stderr=subprocess.STDOUT,
                                 start_new_session=True, env=env)
@@ -350,9 +363,10 @@ async def main() -> int:
                 continue
             log(f"ready after {time.time() - t0:.0f}s")
             outputs[name] = {}
-            diffs = await determinism(url, args.repeats, args.max_tokens, outputs[name])
-            summary.append(f"{name}: determinism groups with >1 distinct output: {diffs} of {2 * len(DET_PROMPTS)}")
-            await replay(url, root, args.replay_rounds)
+            repeats, rounds = SHORT.get(name, (args.repeats, args.replay_rounds))
+            diffs = await determinism(url, repeats, args.max_tokens, outputs[name])
+            summary.append(f"{name}: determinism groups with >1 distinct output: {diffs} of {2 * len(DET_PROMPTS)} (n={repeats})")
+            await replay(url, root, rounds)
         finally:
             stop_server(proc)
             summarize_server_log(logfile)

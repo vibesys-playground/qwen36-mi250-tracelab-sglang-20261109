@@ -1,3 +1,4 @@
+import collections
 import contextlib
 import logging
 import os
@@ -12,6 +13,7 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -169,6 +171,52 @@ def _qsa_index_share_requested(hf_config) -> bool:
         )
     )
 
+
+
+class _DebugStageTimer:
+    """DEBUG ONLY (SGLANG_SPEC_DEBUG_STAGE_TIMING=1, never set when serving).
+
+    Synchronizes the device around the draft, verify and draft-extend stages of a
+    decode step and logs mean milliseconds per stage, per batch size, every
+    ``every`` steps. The syncs remove CPU/GPU overlap, so the numbers split the
+    step's cost; they are not the step's latency in normal serving.
+    """
+
+    def __init__(self, every: int = 200):
+        self.every = every
+        self.acc = {}
+        self.last_end = None
+
+    @contextlib.contextmanager
+    def stage(self, bs: int, name: str):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        yield
+        torch.cuda.synchronize()
+        d = self.acc.setdefault(bs, collections.Counter())
+        d[name] += time.perf_counter() - t0
+
+    def step_begin(self, bs: int):
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        if self.last_end is not None and now - self.last_end < 0.5:
+            self.acc.setdefault(bs, collections.Counter())["between_steps"] += now - self.last_end
+            self.acc[bs]["n_between"] += 1
+
+    def step_end(self, bs: int):
+        torch.cuda.synchronize()
+        self.last_end = time.perf_counter()
+        d = self.acc.setdefault(bs, collections.Counter())
+        d["n"] += 1
+        if d["n"] >= self.every:
+            n, nb = d.pop("n"), d.pop("n_between", 0)
+            between = d.pop("between_steps", 0.0)
+            parts = " ".join(f"{k} {1000 * v / n:.3f}" for k, v in sorted(d.items()))
+            logger.warning(
+                "SPEC_STAGE_TIMING bs=%d steps=%d ms/step: %s between_steps %.3f",
+                bs, n, parts, 1000 * between / max(nb, 1),
+            )
+            self.acc[bs] = collections.Counter()
 
 class EagleDraftWorker(EagleDraftWorkerBase):
     # Always-present draft dispatch. init_attention_backends resolves it before
@@ -1434,6 +1482,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self._debug_stage_timer = (
+            _DebugStageTimer()
+            if get_bool_env_var("SGLANG_SPEC_DEBUG_STAGE_TIMING", "false")
+            else None
+        )
 
     @property
     def last_shared_read_runner(self):
@@ -1550,6 +1603,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            timer = self._debug_stage_timer
+            if timer is not None and batch.forward_mode.is_idle():
+                timer = None
+            tbs = batch.seq_lens.shape[0]
+
+            def _stage(name):
+                return (
+                    timer.stage(tbs, name)
+                    if timer is not None
+                    else contextlib.nullcontext()
+                )
+
+            if timer is not None:
+                timer.step_begin(tbs)
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1583,15 +1650,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
+                    _stage("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(
-                batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                grammar_barrier=grammar_barrier,
-            )
+            with _stage("verify"):
+                batch_output = self.verify(
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    grammar_barrier=grammar_barrier,
+                )
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1606,13 +1675,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
+                    _stage("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, iteration_ids=verify_input.iteration_ids
                     )
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
-                self._post_verify_graphs.join()
+                with _stage("post_verify_join"):
+                    self._post_verify_graphs.join()
+            if timer is not None:
+                timer.step_end(tbs)
 
             if (
                 get_parallel().pp_size > 1

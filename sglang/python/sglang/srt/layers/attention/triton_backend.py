@@ -1993,7 +1993,13 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
-        if self.use_gqa_split_extend and self._gqa_split_extend(
+        # Target verify never takes the GQA split path: with use_unified_verify it
+        # returned above, and otherwise it stays on the stock 2-stage kernel (the
+        # split plan is for prefill-shaped extends and is not captured in graphs).
+        if (
+            self.use_gqa_split_extend
+            and not forward_batch.forward_mode.is_target_verify()
+            and self._gqa_split_extend(
             q=q,
             k=k,
             v=v,
@@ -2009,6 +2015,7 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             k_descale=k_descale,
             v_descale=v_descale,
+        )
         ):
             return o
 
