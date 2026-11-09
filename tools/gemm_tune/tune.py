@@ -30,6 +30,7 @@ def mk(M, N, K, cnt, torch):
 
 
 def h(t):
+    import torch
     return hashlib.sha1(t.view(torch.int16).cpu().numpy().tobytes()).hexdigest()[:12]
 
 
