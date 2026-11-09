@@ -1999,6 +1999,17 @@ class Qwen3_5ForCausalLM(nn.Module):
                     ",".join(_gdn_online_mxfp4),
                     mxfp4,
                 )
+        elif (
+            _hip_packed_in_proj
+            and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
+        ):
+            # gfx90a: pack in_proj_qkvz + in_proj_ba so decode runs one HIP GEMV for both.
+            packed = 0
+            for module in self.modules():
+                if isinstance(module, Qwen3_5GatedDeltaNet):
+                    module.finalize_fused_in_proj()
+                    packed += int(module._fused_in_proj_weight is not None)
+            logger.info("Packed BF16 GDN input projection enabled for %d layers", packed)
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
