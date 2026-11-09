@@ -721,6 +721,11 @@ class Envs:
     SGLANG_DISABLE_OVERLAP_AFTER_PREFILL = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP"
     )
+    # Hold a pure decode launch until just before the running step ends, so a prefill that
+    # arrives meanwhile goes first (scheduler_components/defer_decode_launch.py).
+    SGLANG_DEFER_DECODE_LAUNCH = EnvBool(False)
+    # Host-time slack left before the estimated end of the running decode step.
+    SGLANG_DEFER_DECODE_LAUNCH_MARGIN_US = EnvInt(500)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.

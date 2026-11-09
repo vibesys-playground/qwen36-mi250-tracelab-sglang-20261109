@@ -255,6 +255,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.defer_decode_launch import DeferDecodeLaunch
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -2161,15 +2162,24 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
+        defer = self._create_defer_decode_launch()
+
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if defer is not None:
+                if tmp_result.copy_done is not None:
+                    tmp_result.copy_done.synchronize()
+                defer.on_done(time.perf_counter())
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             if self.gracefully_exit:
                 break
             self.increment_scheduler_iterations()
+
+            if defer is not None and self._can_defer_decode_launch():
+                defer.wait(done_evt=self.result_queue[-1][1].copy_done)
 
             # Receive requests
             self.ingest_requests()
@@ -2201,7 +2211,16 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                t_launch = time.perf_counter()
                 batch_result = self.run_batch(batch)
+                if defer is not None:
+                    defer.on_launch(
+                        decode_bs=(
+                            batch.batch_size() if batch.forward_mode.is_decode() else 0
+                        ),
+                        t_start=t_launch,
+                        t_end=time.perf_counter(),
+                    )
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -2226,6 +2245,33 @@ class Scheduler(
             self.last_batch = batch
 
             self.invariant_checker.run(CheckPhase.BUSY, batch)
+
+    def _create_defer_decode_launch(self) -> Optional[DeferDecodeLaunch]:
+        """Set up the deferred decode launch on the request-receiving rank, if enabled."""
+        if not (envs.SGLANG_DEFER_DECODE_LAUNCH.get() and self.is_generation):
+            return None
+        if self.recv_from_tokenizer is None:
+            return None
+        defer = DeferDecodeLaunch.create(
+            sockets=[self.recv_from_tokenizer, self.ipc_channels.recv_from_rpc],
+            margin_us=envs.SGLANG_DEFER_DECODE_LAUNCH_MARGIN_US.get(),
+        )
+        logger.info(f"Deferred decode launch: {'on' if defer else 'unavailable'}")
+        return defer
+
+    def _can_defer_decode_launch(self) -> bool:
+        """The next batch is a pure decode behind one in-flight pure decode step."""
+        last = self.last_batch
+        return (
+            last is not None
+            and last.forward_mode.is_decode()
+            and last.spec_algorithm.is_none()
+            and not last.grammar_needs_sync()
+            and len(self.result_queue) == 1
+            and len(self.waiting_queue) == 0
+            and not self._engine_paused
+            and not self.running_batch.is_empty()
+        )
 
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
