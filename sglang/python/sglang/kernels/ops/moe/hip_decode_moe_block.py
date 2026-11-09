@@ -32,9 +32,10 @@ HIDDEN, NUM_EXPERTS, INTER, TOPK, MAX_M = 2048, 256, 256, 8, 8
 # batches keep the per-op path.
 DISPATCH_MAX_M = 4
 CHUNK_M = 2
-# Kernel variant bits (see hip_decode_moe_block.hip): 1 DPP top-8, 2 pipelined w13/w2 loops,
-# 4 DPP wave sums, 8 phase stamps (debug). Built for every M <= CHUNK_M.
-F_TOPK, F_PIPE, F_DSUM, F_STAMP = 1, 2, 4, 8
+# Kernel variant bits (see hip_decode_moe_block.hip): 1 DPP top-8, 4 DPP wave sums, 8 phase
+# stamps (debug), 16 phase-B inputs staged in LDS, 32 two phase-B tasks per iteration, 64 two
+# w13 tasks per iteration. Only the combinations listed in the .hip ("Built") exist.
+F_TOPK, F_DSUM, F_STAMP, F_LDSB, F_B2, F_W2X = 1, 4, 8, 16, 32, 64
 DEFAULT_VARIANT = 0
 # Workgroups per CU in the grid, capped by what is co-resident for the variant and M.
 DEFAULT_WG_PER_CU = 1

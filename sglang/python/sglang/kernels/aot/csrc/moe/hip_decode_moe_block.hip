@@ -31,11 +31,13 @@
 //   F_TOPK  top-8 by DPP/readlane wave max on a 32-bit key (bf16 logit order, lowest id on
 //           ties) instead of the shuffle butterfly on a 64-bit key; ids and weights are
 //           bitwise identical.
-//   F_PIPE  the w13 and w2 loops load the next task's weights before reducing the current one
-//           (two tasks of HBM reads in flight per wave); same math.
 //   F_DSUM  wave/half-wave sums by DPP within rows and readlane across rows (fixed tree,
 //           per row, independent of M and grid; differs in rounding from the butterfly).
 //   F_STAMP per-wave s_memrealtime stamps at phase boundaries into the workspace (debug).
+//   F_LDSB  phase B reads the act vectors, the shared act and the sigmoid gate from LDS,
+//           staged once per workgroup after the barrier; same math.
+//   F_B2    phase B issues two tasks' w2 loads before reducing either; same math.
+//   F_W2X   the w13 loop issues two tasks' loads before reducing either; same math.
 //
 // Coherence (gfx90a): agent-scope release fence in every wave before an arrival
 // (s_waitcnt vmcnt(0)), glc atomics on the counters, agent-scope acquire fence
@@ -70,8 +72,14 @@ constexpr int NROUTER = NE, NSGU = 2 * INTER;
 constexpr int R_STRIDE = NROUTER + NSGU;  // r row = [router logits | shared gate_up]
 constexpr unsigned SPIN_MAX = 1u << 24;
 
-constexpr int F_TOPK = 1, F_PIPE = 2, F_DSUM = 4, F_STAMP = 8;
-constexpr int NVARIANT = 16;  // variants instantiated for M <= 2; M > 2 runs variant 0
+constexpr int F_TOPK = 1, F_DSUM = 4, F_STAMP = 8, F_LDSB = 16, F_B2 = 32, F_W2X = 64;
+constexpr int NVARIANT = 128;
+// Variants built for M <= 2 (M > 2 runs variant 0 only); the stamped (| F_STAMP) builds are
+// for the bench.
+using Built = std::integer_sequence<int, 0, 8, 1, 5, 13, 21, 29, 37, 53, 61, 85, 117, 125>;
+template <int... Vs>
+constexpr bool in_seq(int v, std::integer_sequence<int, Vs...>) { return ((v == Vs) || ...); }
+inline bool built(int64_t m, int64_t v) { return v == 0 || (m <= 2 && v >= 0 && v < NVARIANT && in_seq((int)v, Built{})); }
 constexpr int NSTAMP = 8, STAMP_WG = 256;
 
 // Workspace (bytes); zero-initialised once by the caller and kept for the process.
@@ -293,6 +301,10 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
   __shared__ signed char s_slot[MAX_M * TOPK][MAX_M];
   __shared__ int s_wcnt[WPB];
   __shared__ int s_nu;
+  constexpr bool LDSB = (V & F_LDSB) != 0;
+  __shared__ uint4 s_actv[LDSB ? M * TOPK * INTER / 8 : 1];
+  __shared__ uint4 s_sa[LDSB ? M * INTER / 8 : 1];
+  __shared__ float s_sig[M];
 
   uint4 xr[M][4];
   load_x<M>(a.x, lane, xr);
@@ -444,25 +456,24 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
           if (k >= 0) act[(m * TOPK + k) * INTER + i] = (uint16_t)f2bf(silu(bfr(o[0][m])) * bfr(o[1][m]));
         }
     };
-    if constexpr ((V & F_PIPE) != 0) {
-      // Next task's 8 KB is issued before this task's reduction, so two tasks are in flight.
-      auto load13 = [&](int t2, uint4 (&w)[2][4]) {
-        const uint16_t* W = a.w13 + (size_t)s_ulist[t2 / INTER] * NSGU * HID + (size_t)(t2 % INTER) * HID;
-        load_pair(W, W + (size_t)INTER * HID, lane, w);
-      };
-      uint4 wc[2][4], wn[2][4];
-      if (gw < ntask) load13(gw, wc);
-      for (int t2 = gw; t2 < ntask; t2 += NW) {
-        const bool more = t2 + NW < ntask;
-        if (more) load13(t2 + NW, wn);
+    if constexpr ((V & F_W2X) != 0) {
+      // Two tasks per iteration: 16 KB of loads issued before either reduction.
+      for (int t2 = gw; t2 < ntask; t2 += 2 * NW) {
+        const bool two = t2 + NW < ntask;
+        uint4 w0[2][4], w1[2][4];
+        const uint16_t* W0 = a.w13 + (size_t)s_ulist[t2 / INTER] * NSGU * HID + (size_t)(t2 % INTER) * HID;
+        load_pair(W0, W0 + (size_t)INTER * HID, lane, w0);
+        if (two) {
+          const int t1 = t2 + NW;
+          const uint16_t* W1 = a.w13 + (size_t)s_ulist[t1 / INTER] * NSGU * HID + (size_t)(t1 % INTER) * HID;
+          load_pair(W1, W1 + (size_t)INTER * HID, lane, w1);
+        }
         float o[2][M];
-        dots_pair<M, V>(wc, xr, o);
+        dots_pair<M, V>(w0, xr, o);
         w13_out(t2, o);
-        if (more) {
-#pragma unroll
-          for (int q = 0; q < 2; ++q)
-#pragma unroll
-            for (int j = 0; j < 4; ++j) wc[q][j] = wn[q][j];
+        if (two) {
+          dots_pair<M, V>(w1, xr, o);
+          w13_out(t2 + NW, o);
         }
       }
     } else {
@@ -483,15 +494,35 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
   {
     const int half = lane >> 5, kk = (lane & 31) * 8;
     const int ntask = M * (HID / 2);
+    if constexpr ((V & F_LDSB) != 0) {
+      // Stage the act vectors, the shared expert's act and the sigmoid gate once per
+      // workgroup, so a task's only global loads are its w2 and shared-down half-rows.
+      // Same arithmetic as the per-task path below.
+      for (int i = tid; i < M * TOPK * INTER / 8; i += NT) s_actv[i] = ld16(act + i * 8);
+      for (int i = tid; i < M * INTER / 8; i += NT) {
+        const int m = i / (INTER / 8), c = (i % (INTER / 8)) * 8;
+        const uint4 g4 = ld16(r + m * R_STRIDE + NROUTER + c), u4 = ld16(r + m * R_STRIDE + NROUTER + INTER + c);
+        uint4 sa;
+        sa.x = f2bf(silu(lo(g4.x)) * lo(u4.x)) | (f2bf(silu(hi(g4.x)) * hi(u4.x)) << 16);
+        sa.y = f2bf(silu(lo(g4.y)) * lo(u4.y)) | (f2bf(silu(hi(g4.y)) * hi(u4.y)) << 16);
+        sa.z = f2bf(silu(lo(g4.z)) * lo(u4.z)) | (f2bf(silu(hi(g4.z)) * hi(u4.z)) << 16);
+        sa.w = f2bf(silu(lo(g4.w)) * lo(u4.w)) | (f2bf(silu(hi(g4.w)) * hi(u4.w)) << 16);
+        s_sa[i] = sa;
+      }
+      if (tid < M) s_sig[tid] = 1.0f / (1.0f + expf(-gate[tid]));
+      __syncthreads();
+    }
     auto loadB = [&](int t3, BT& b) {
       const int m = t3 / (HID / 2), row = 2 * (t3 % (HID / 2)) + half;
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) b.wv[k] = ld16(a.w2 + ((size_t)s_ids[m][k] * HID + row) * INTER + kk);
       b.sw = ld16(a.w_sdown + (size_t)row * INTER + kk);
+      if constexpr ((V & F_LDSB) == 0) {
 #pragma unroll
-      for (int k = 0; k < TOPK; ++k) b.av[k] = ld16(act + (m * TOPK + k) * INTER + kk);
-      b.g4 = ld16(r + m * R_STRIDE + NROUTER + kk);
-      b.u4 = ld16(r + m * R_STRIDE + NROUTER + INTER + kk);
+        for (int k = 0; k < TOPK; ++k) b.av[k] = ld16(act + (m * TOPK + k) * INTER + kk);
+        b.g4 = ld16(r + m * R_STRIDE + NROUTER + kk);
+        b.u4 = ld16(r + m * R_STRIDE + NROUTER + INTER + kk);
+      }
     };
     auto computeB = [&](int t3, const BT& b) {
       const int m = t3 / (HID / 2), row = 2 * (t3 % (HID / 2)) + half;
@@ -499,29 +530,37 @@ __global__ void __launch_bounds__(NT) moe_block_kernel(Args a) {
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) {
         float d = 0.f;
-        dot8(b.wv[k], b.av[k], d);
+        if constexpr ((V & F_LDSB) != 0) dot8(b.wv[k], s_actv[((m * TOPK + k) * INTER + kk) / 8], d);
+        else dot8(b.wv[k], b.av[k], d);
         d = hsum<V>(d, lane);
         routed += bfr(d * s_w[m][k]);
       }
       uint4 sa;
-      sa.x = f2bf(silu(lo(b.g4.x)) * lo(b.u4.x)) | (f2bf(silu(hi(b.g4.x)) * hi(b.u4.x)) << 16);
-      sa.y = f2bf(silu(lo(b.g4.y)) * lo(b.u4.y)) | (f2bf(silu(hi(b.g4.y)) * hi(b.u4.y)) << 16);
-      sa.z = f2bf(silu(lo(b.g4.z)) * lo(b.u4.z)) | (f2bf(silu(hi(b.g4.z)) * hi(b.u4.z)) << 16);
-      sa.w = f2bf(silu(lo(b.g4.w)) * lo(b.u4.w)) | (f2bf(silu(hi(b.g4.w)) * hi(b.u4.w)) << 16);
+      float sig;
+      if constexpr ((V & F_LDSB) != 0) {
+        sa = s_sa[(m * INTER + kk) / 8];
+        sig = s_sig[m];
+      } else {
+        sa.x = f2bf(silu(lo(b.g4.x)) * lo(b.u4.x)) | (f2bf(silu(hi(b.g4.x)) * hi(b.u4.x)) << 16);
+        sa.y = f2bf(silu(lo(b.g4.y)) * lo(b.u4.y)) | (f2bf(silu(hi(b.g4.y)) * hi(b.u4.y)) << 16);
+        sa.z = f2bf(silu(lo(b.g4.z)) * lo(b.u4.z)) | (f2bf(silu(hi(b.g4.z)) * hi(b.u4.z)) << 16);
+        sa.w = f2bf(silu(lo(b.g4.w)) * lo(b.u4.w)) | (f2bf(silu(hi(b.g4.w)) * hi(b.u4.w)) << 16);
+        sig = 1.0f / (1.0f + expf(-gate[m]));
+      }
       float sd = 0.f;
       dot8(b.sw, sa, sd);
       sd = hsum<V>(sd, lane);
-      const float sig = 1.0f / (1.0f + expf(-gate[m]));
       if ((lane & 31) == 0) a.out[(size_t)m * HID + row] = (uint16_t)f2bf(bfr(routed) + sig * bfr(sd));
     };
-    if constexpr ((V & F_PIPE) != 0) {
-      BT bc, bn;
-      if (gw < ntask) loadB(gw, bc);
-      for (int t3 = gw; t3 < ntask; t3 += NW) {
-        const bool more = t3 + NW < ntask;
-        if (more) loadB(t3 + NW, bn);
-        computeB(t3, bc);
-        if (more) bc = bn;
+    if constexpr ((V & F_B2) != 0) {
+      // Two tasks per iteration: both tasks' w2 loads are issued before either reduction.
+      for (int t3 = gw; t3 < ntask; t3 += 2 * NW) {
+        const bool two = t3 + NW < ntask;
+        BT b0, b1;
+        loadB(t3, b0);
+        if (two) loadB(t3 + NW, b1);
+        computeB(t3, b0);
+        if (two) computeB(t3 + NW, b1);
       }
     } else {
       for (int t3 = gw; t3 < ntask; t3 += NW) {
@@ -564,12 +603,12 @@ struct VTable {
 
 template <int M>
 void launch_m(int v, dim3 g, dim3 b, hipStream_t s, const Args& a) {
-  if constexpr (M <= 2) VTable<M>::launch_v(v, g, b, s, a, std::make_integer_sequence<int, NVARIANT>{});
+  if constexpr (M <= 2) VTable<M>::launch_v(v, g, b, s, a, Built{});
   else VTable<M>::template launch<0>(g, b, s, a);
 }
 template <int M>
 int grid_m(int v) {
-  if constexpr (M <= 2) return VTable<M>::grid_v(v, std::make_integer_sequence<int, NVARIANT>{});
+  if constexpr (M <= 2) return VTable<M>::grid_v(v, Built{});
   else return v == 0 ? max_grid_for<M, 0>() : 0;
 }
 
@@ -579,7 +618,7 @@ int grid_m(int v) {
 // or the variant is not built for this M.
 int64_t hip_decode_moe_block_max_grid(int64_t m, int64_t variant) {
   using namespace hip_decode_moe;
-  if (variant < 0 || variant >= NVARIANT) return 0;
+  if (!built(m, variant)) return 0;
   const int v = (int)variant;
   switch (m) {
     case 1: return grid_m<1>(v);
@@ -609,7 +648,7 @@ void hip_decode_moe_block(
   using namespace hip_decode_moe;
   const int64_t M = x.size(0);
   TORCH_CHECK(M >= 1 && M <= MAX_M, "hip_decode_moe_block: M must be in 1..8");
-  TORCH_CHECK(variant >= 0 && variant < NVARIANT && (M <= 2 || variant == 0),
+  TORCH_CHECK(built(M, variant),
               "hip_decode_moe_block: variant ", variant, " is not built for M=", M);
   TORCH_CHECK(x.dim() == 2 && x.size(1) == HID && x.is_contiguous(), "x must be [M, 2048] contiguous");
   TORCH_CHECK(out.sizes() == x.sizes() && out.is_contiguous(), "out must match x");

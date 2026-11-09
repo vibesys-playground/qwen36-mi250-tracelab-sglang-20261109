@@ -192,12 +192,16 @@ def rel_err(a, ref):
 
 
 # ------------------------------------------------------------------------------------ plan 23
-VARIANTS = [  # (name, variant bits, workgroups per CU)
-    ("base", 0, 1), ("topk", 1, 1), ("pipe", 2, 1), ("topk+pipe", 3, 1), ("dsum", 4, 1),
-    ("topk+dsum", 5, 1), ("topk+dsum/2", 5, 2), ("topk+dsum/3", 5, 3), ("all", 7, 1), ("all/2", 7, 2),
-    ("pipe+dsum/2", 6, 2), ("base/2", 0, 2),
+VARIANTS = [  # (name, variant bits, workgroups per CU); bits in hip_decode_moe_block.hip
+    ("base", 0, 1), ("topk", 1, 1), ("topk+dsum", 5, 1), ("topk+dsum/2", 5, 2),
+    ("ldsb", 21, 1), ("ldsb/2", 21, 2), ("b2", 37, 1), ("b2/2", 37, 2),
+    ("ldsb+b2", 53, 1), ("ldsb+b2/2", 53, 2), ("ldsb+b2/3", 53, 3),
+    ("ldsb+b2+w2x", 117, 1), ("ldsb+b2+w2x/2", 117, 2), ("ldsb+w2x/2", 85, 2),
 ]
-TICK_US = 0.01  # s_memrealtime is 100 MHz on gfx90a
+STAMPED = ["base", "topk+dsum", "topk+dsum/2", "ldsb", "ldsb+b2", "ldsb+b2/2", "ldsb+b2+w2x", "ldsb+b2+w2x/2"]
+# s_memrealtime advances 25 ticks per us here: j144 spans at 0.01 us/tick were 1/4 of the
+# graph time per block; the bench prints graph_us_per_block / span to keep this honest.
+TICK_US = 0.04
 
 
 def phases(st, G):
@@ -248,6 +252,8 @@ def variants_main():
     xc = [bf(torch.randn(2, HID, device=DEV, generator=gen)) for _ in range(4)]
     y8_base = kern(blocks[0], x8, 0, 1).clone()
     yc_base = [kern(blocks[i], xc[i], 0, 1).clone() for i in range(4)]
+    y8_d = kern(blocks[0], x8, 5, 1).clone()
+    yc_d = [kern(blocks[i], xc[i], 5, 1).clone() for i in range(4)]
     ok_by = {}
     for name, v, wpc in VARIANTS:
         if co[(2, v)] < wpc * cu and wpc > 1:
@@ -257,6 +263,8 @@ def variants_main():
         y8 = kern(blocks[0], x8, v, wpc).clone()
         c["bitwise_eq_base"] = bool(torch.equal(y8, y8_base)) and all(
             torch.equal(kern(blocks[i], xc[i], v, wpc), yc_base[i]) for i in range(4))
+        c["bitwise_eq_topk+dsum"] = bool(torch.equal(y8, y8_d)) and all(
+            torch.equal(kern(blocks[i], xc[i], v, wpc), yc_d[i]) for i in range(4))
         errs, ids_ok = [], True
         for i in range(4):
             y = kern(blocks[i], xc[i], v, wpc)
@@ -322,7 +330,7 @@ def variants_main():
 
     # ---- per-phase times from the stamped build (last layer of an 8-layer graph, 30 replays)
     ph = {}
-    for n in ["base", "topk", "topk+pipe", "topk+dsum", "topk+dsum/2", "topk+dsum/3", "all", "all/2"]:
+    for n in STAMPED:
         if n not in ok_by:
             continue
         v, w = vmap[n]
@@ -344,6 +352,7 @@ def variants_main():
             agg = {k: round(sorted(r[k] for r in rows)[len(rows) // 2], 2) for k in rows[0]}
             agg["graph_us_per_block"] = round(t_graph, 2)
             agg["grid"] = G
+            agg["graph_over_span"] = round(t_graph / max(agg["span"], 1e-6), 3)
             ph[f"{n} M={M}"] = agg
             log("phases", n, f"M={M}", agg)
     RES["phases"] = ph
